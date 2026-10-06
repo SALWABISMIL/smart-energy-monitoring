@@ -5,28 +5,9 @@
    Arduino IDE 1.8.19
    ESP32 Core 3.x
 
-   PZEM-004T V3:
-   AC      = 0x01
-   Heater  = 0x02
-   Lights  = 0x03
-
-   PZEM UART:
-   RX = GPIO16
-   TX = GPIO17
-
-   RELAYS:
-   AC      = GPIO25
-   Heater  = GPIO26
-   Lights  = GPIO27
-   Spare   = GPIO32
-
-   Relay logic:
-   LOW  = ON
-   HIGH = OFF
-
-   DASHBOARD:
-   7-DAY HISTORY IS PART OF MAIN DASHBOARD
-   DAY NAME + DATE + ENERGY
+   DASHBOARD UPDATE:
+   No full-page reload.
+   Dashboard values update through /api.
 */
 
 #include <WiFi.h>
@@ -228,13 +209,11 @@ String powerUnit = "kW";
 // ============================================================
 
 String htmlEscape(String text) {
-
   text.replace("&", "&amp;");
   text.replace("<", "&lt;");
   text.replace(">", "&gt;");
   text.replace("\"", "&quot;");
   text.replace("'", "&#39;");
-
   return text;
 }
 
@@ -247,11 +226,9 @@ String selected(bool value) {
 }
 
 float safeFloat(float value) {
-
   if (isnan(value) || isinf(value)) {
     return 0;
   }
-
   return value;
 }
 
@@ -347,8 +324,7 @@ int getMonthNumber() {
 }
 
 // ============================================================
-// WEEKDAY NAME
-// Converts YYYY-MM-DD into Sunday/Monday/etc.
+// WEEKDAY
 // ============================================================
 
 int getWeekdayFromDate(String date) {
@@ -357,14 +333,9 @@ int getWeekdayFromDate(String date) {
     return -1;
   }
 
-  int year =
-    date.substring(0, 4).toInt();
-
-  int month =
-    date.substring(5, 7).toInt();
-
-  int day =
-    date.substring(8, 10).toInt();
+  int year = date.substring(0, 4).toInt();
+  int month = date.substring(5, 7).toInt();
+  int day = date.substring(8, 10).toInt();
 
   if (
     year < 2000 ||
@@ -376,7 +347,6 @@ int getWeekdayFromDate(String date) {
     return -1;
   }
 
-  // Sakamoto algorithm
   static const int monthTable[] = {
     0, 3, 2, 5, 0, 3,
     5, 1, 4, 6, 2, 4
@@ -403,34 +373,119 @@ int getWeekdayFromDate(String date) {
 
 String getWeekdayName(String date) {
 
-  int weekday =
-    getWeekdayFromDate(date);
+  int weekday = getWeekdayFromDate(date);
 
   switch (weekday) {
 
-    case 0:
-      return "Sunday";
-
-    case 1:
-      return "Monday";
-
-    case 2:
-      return "Tuesday";
-
-    case 3:
-      return "Wednesday";
-
-    case 4:
-      return "Thursday";
-
-    case 5:
-      return "Friday";
-
-    case 6:
-      return "Saturday";
+    case 0: return "Sunday";
+    case 1: return "Monday";
+    case 2: return "Tuesday";
+    case 3: return "Wednesday";
+    case 4: return "Thursday";
+    case 5: return "Friday";
+    case 6: return "Saturday";
 
     default:
       return "-";
+  }
+}
+
+// ============================================================
+// HISTORY DATE INITIALIZATION
+// ============================================================
+
+void initializeHistoryDates() {
+
+  time_t now = time(nullptr);
+
+  if (now < 100000) {
+    return;
+  }
+
+  struct tm currentTm;
+
+  if (!localtime_r(&now, &currentTm)) {
+    return;
+  }
+
+  String todayDate = getDateString();
+
+  bool validExistingHistory = false;
+
+  for (int i = 0; i < HISTORY_DAYS; i++) {
+
+    if (historyDate[i].length() == 10) {
+      validExistingHistory = true;
+      break;
+    }
+  }
+
+  if (!validExistingHistory) {
+
+    for (int i = 0; i < HISTORY_DAYS; i++) {
+
+      time_t dayTime =
+        now -
+        ((HISTORY_DAYS - 1 - i) * 86400);
+
+      struct tm dayTm;
+
+      if (localtime_r(&dayTime, &dayTm)) {
+
+        char dateBuf[11];
+
+        strftime(
+          dateBuf,
+          sizeof(dateBuf),
+          "%Y-%m-%d",
+          &dayTm
+        );
+
+        historyDate[i] = String(dateBuf);
+        historyEnergy[i] = 0;
+      }
+    }
+
+    currentHistoryDay = HISTORY_DAYS - 1;
+
+    historyEnergy[currentHistoryDay] =
+      dailyEnergyKWh;
+
+    historyDate[currentHistoryDay] =
+      todayDate;
+
+    saveEnergyData();
+
+    return;
+  }
+
+  // Make sure today's date exists.
+  bool todayExists = false;
+
+  for (int i = 0; i < HISTORY_DAYS; i++) {
+
+    if (historyDate[i] == todayDate) {
+      currentHistoryDay = i;
+      todayExists = true;
+      break;
+    }
+  }
+
+  if (!todayExists) {
+
+    currentHistoryDay++;
+
+    if (currentHistoryDay >= HISTORY_DAYS) {
+      currentHistoryDay = 0;
+    }
+
+    historyDate[currentHistoryDay] =
+      todayDate;
+
+    historyEnergy[currentHistoryDay] =
+      dailyEnergyKWh;
+
+    saveEnergyData();
   }
 }
 
@@ -475,15 +530,12 @@ void allRelaysOff() {
 }
 
 // ============================================================
-// WIFI PREFERENCES
+// WIFI
 // ============================================================
 
 void loadWiFiSettings() {
 
-  preferences.begin(
-    "wifi",
-    true
-  );
+  preferences.begin("wifi", true);
 
   savedSSID =
     preferences.getString(
@@ -505,10 +557,7 @@ void saveWiFiSettings(
   String password
 ) {
 
-  preferences.begin(
-    "wifi",
-    false
-  );
+  preferences.begin("wifi", false);
 
   preferences.putString(
     "ssid",
@@ -536,24 +585,12 @@ void startAccessPoint() {
   wifiConnected = false;
 
   Serial.println();
-  Serial.println(
-    "================================"
-  );
-  Serial.println(
-    "WIFI SETUP MODE"
-  );
-  Serial.println(
-    "SSID: Smart-Energy-Setup"
-  );
-  Serial.println(
-    "PASSWORD: 12345678"
-  );
-  Serial.println(
-    "IP: 192.168.4.1"
-  );
-  Serial.println(
-    "================================"
-  );
+  Serial.println("================================");
+  Serial.println("WIFI SETUP MODE");
+  Serial.println("SSID: Smart-Energy-Setup");
+  Serial.println("PASSWORD: 12345678");
+  Serial.println("IP: 192.168.4.1");
+  Serial.println("================================");
 }
 
 void connectWiFi() {
@@ -561,32 +598,23 @@ void connectWiFi() {
   if (savedSSID.length() == 0) {
 
     startAccessPoint();
-
     return;
   }
 
   WiFi.mode(WIFI_STA);
 
-  WiFi.setHostname(
-    HOSTNAME
-  );
+  WiFi.setHostname(HOSTNAME);
 
   Serial.println();
-  Serial.println(
-    "Connecting to WiFi..."
-  );
-
-  Serial.println(
-    savedSSID
-  );
+  Serial.println("Connecting to WiFi...");
+  Serial.println(savedSSID);
 
   WiFi.begin(
     savedSSID.c_str(),
     savedPassword.c_str()
   );
 
-  unsigned long start =
-    millis();
+  unsigned long start = millis();
 
   while (
     WiFi.status() != WL_CONNECTED &&
@@ -594,7 +622,6 @@ void connectWiFi() {
   ) {
 
     delay(500);
-
     Serial.print(".");
   }
 
@@ -605,34 +632,20 @@ void connectWiFi() {
     wifiConnected = true;
     apMode = false;
 
-    Serial.println(
-      "WiFi connected"
-    );
+    Serial.println("WiFi connected");
 
-    Serial.print(
-      "IP: "
-    );
-
-    Serial.println(
-      WiFi.localIP()
-    );
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
 
     if (MDNS.begin(HOSTNAME)) {
 
-      Serial.println(
-        "mDNS started"
-      );
-
-      Serial.println(
-        "http://smartenergy.local"
-      );
+      Serial.println("mDNS started");
+      Serial.println("http://smartenergy.local");
     }
 
   } else {
 
-    Serial.println(
-      "WiFi connection failed"
-    );
+    Serial.println("WiFi connection failed");
 
     startAccessPoint();
   }
@@ -644,10 +657,7 @@ void connectWiFi() {
 
 void loadDashboardSettings() {
 
-  preferences.begin(
-    "design",
-    true
-  );
+  preferences.begin("design", true);
 
   dashboardTitle =
     preferences.getString(
@@ -762,10 +772,7 @@ void loadDashboardSettings() {
 
 void saveDashboardSettings() {
 
-  preferences.begin(
-    "design",
-    false
-  );
+  preferences.begin("design", false);
 
   preferences.putString(
     "title",
@@ -802,50 +809,15 @@ void saveDashboardSettings() {
     dashboardRadius
   );
 
-  preferences.putBool(
-    "showac",
-    showAC
-  );
-
-  preferences.putBool(
-    "showheat",
-    showHeater
-  );
-
-  preferences.putBool(
-    "showlight",
-    showLights
-  );
-
-  preferences.putBool(
-    "voltage",
-    showVoltage
-  );
-
-  preferences.putBool(
-    "current",
-    showCurrent
-  );
-
-  preferences.putBool(
-    "energy",
-    showEnergy
-  );
-
-  preferences.putBool(
-    "billing",
-    showBilling
-  );
-
-  preferences.putBool(
-    "history",
-    showHistory
-  );
-
-  preferences.putBool(
-    "saving",
-    showEnergySaving
-  );
+  preferences.putBool("showac", showAC);
+  preferences.putBool("showheat", showHeater);
+  preferences.putBool("showlight", showLights);
+  preferences.putBool("voltage", showVoltage);
+  preferences.putBool("current", showCurrent);
+  preferences.putBool("energy", showEnergy);
+  preferences.putBool("billing", showBilling);
+  preferences.putBool("history", showHistory);
+  preferences.putBool("saving", showEnergySaving);
 
   preferences.putInt(
     "refresh",
@@ -866,10 +838,7 @@ void saveDashboardSettings() {
 
 void loadSystemSettings() {
 
-  preferences.begin(
-    "system",
-    true
-  );
+  preferences.begin("system", true);
 
   tariff =
     preferences.getFloat(
@@ -900,10 +869,7 @@ void loadSystemSettings() {
 
 void saveSystemSettings() {
 
-  preferences.begin(
-    "system",
-    false
-  );
+  preferences.begin("system", false);
 
   preferences.putFloat(
     "tariff",
@@ -934,10 +900,7 @@ void saveSystemSettings() {
 
 void loadEnergyData() {
 
-  preferences.begin(
-    "energy",
-    true
-  );
+  preferences.begin("energy", true);
 
   dailyEnergyKWh =
     preferences.getFloat(
@@ -975,6 +938,13 @@ void loadEnergyData() {
       0
     );
 
+  if (
+    currentHistoryDay < 0 ||
+    currentHistoryDay >= HISTORY_DAYS
+  ) {
+    currentHistoryDay = 0;
+  }
+
   for (
     int i = 0;
     i < HISTORY_DAYS;
@@ -1005,10 +975,7 @@ void loadEnergyData() {
 
 void saveEnergyData() {
 
-  preferences.begin(
-    "energy",
-    false
-  );
+  preferences.begin("energy", false);
 
   preferences.putFloat(
     "daily",
@@ -1067,18 +1034,15 @@ void saveEnergyData() {
 }
 
 // ============================================================
-// PZEM READING
+// PZEM
 // ============================================================
 
 float readPZEMVoltage(
   PZEM004Tv30 &pzem
 ) {
 
-  float value =
-    pzem.voltage();
-
   return safeFloat(
-    value
+    pzem.voltage()
   );
 }
 
@@ -1086,11 +1050,8 @@ float readPZEMCurrent(
   PZEM004Tv30 &pzem
 ) {
 
-  float value =
-    pzem.current();
-
   return safeFloat(
-    value
+    pzem.current()
   );
 }
 
@@ -1098,11 +1059,8 @@ float readPZEMPower(
   PZEM004Tv30 &pzem
 ) {
 
-  float value =
-    pzem.power();
-
   return safeFloat(
-    value
+    pzem.power()
   );
 }
 
@@ -1110,99 +1068,65 @@ float readPZEMEnergy(
   PZEM004Tv30 &pzem
 ) {
 
-  float value =
-    pzem.energy();
-
   return safeFloat(
-    value
+    pzem.energy()
   );
 }
 
 void readPZEMs() {
 
   acVoltage =
-    readPZEMVoltage(
-      pzemAC
-    );
+    readPZEMVoltage(pzemAC);
 
   acCurrent =
-    readPZEMCurrent(
-      pzemAC
-    );
+    readPZEMCurrent(pzemAC);
 
   acPower =
-    readPZEMPower(
-      pzemAC
-    );
+    readPZEMPower(pzemAC);
 
   acEnergy =
-    readPZEMEnergy(
-      pzemAC
-    );
+    readPZEMEnergy(pzemAC);
 
   heaterVoltage =
-    readPZEMVoltage(
-      pzemHeater
-    );
+    readPZEMVoltage(pzemHeater);
 
   heaterCurrent =
-    readPZEMCurrent(
-      pzemHeater
-    );
+    readPZEMCurrent(pzemHeater);
 
   heaterPower =
-    readPZEMPower(
-      pzemHeater
-    );
+    readPZEMPower(pzemHeater);
 
   heaterEnergy =
-    readPZEMEnergy(
-      pzemHeater
-    );
+    readPZEMEnergy(pzemHeater);
 
   lightsVoltage =
-    readPZEMVoltage(
-      pzemLights
-    );
+    readPZEMVoltage(pzemLights);
 
   lightsCurrent =
-    readPZEMCurrent(
-      pzemLights
-    );
+    readPZEMCurrent(pzemLights);
 
   lightsPower =
-    readPZEMPower(
-      pzemLights
-    );
+    readPZEMPower(pzemLights);
 
   lightsEnergy =
-    readPZEMEnergy(
-      pzemLights
-    );
-
-  totalPowerW =
-    acPower +
-    heaterPower +
-    lightsPower;
+    readPZEMEnergy(pzemLights);
 
   totalPowerW =
     safeFloat(
-      totalPowerW
+      acPower +
+      heaterPower +
+      lightsPower
     );
 
   totalEnergyKWh =
-    acEnergy +
-    heaterEnergy +
-    lightsEnergy;
-
-  totalEnergyKWh =
     safeFloat(
-      totalEnergyKWh
+      acEnergy +
+      heaterEnergy +
+      lightsEnergy
     );
 
   highConsumption =
-    totalPowerW >=
-    highPowerLimitW;
+    totalPowerW >= highPowerLimitW;
 }
 
 // ============================================================
@@ -1212,9 +1136,7 @@ void readPZEMs() {
 void updateEnergyTracking() {
 
   float currentTotalEnergy =
-    safeFloat(
-      totalEnergyKWh
-    );
+    safeFloat(totalEnergyKWh);
 
   if (
     lastTotalEnergy > 0 &&
@@ -1230,11 +1152,8 @@ void updateEnergyTracking() {
       difference < 10.0f
     ) {
 
-      dailyEnergyKWh +=
-        difference;
-
-      monthlyEnergyKWh +=
-        difference;
+      dailyEnergyKWh += difference;
+      monthlyEnergyKWh += difference;
     }
   }
 
@@ -1251,8 +1170,7 @@ void updateEnergyTracking() {
 
     if (lastDayNumber == -1) {
 
-      lastDayNumber =
-        today;
+      lastDayNumber = today;
 
     } else if (
       today != lastDayNumber
@@ -1261,27 +1179,20 @@ void updateEnergyTracking() {
       currentHistoryDay++;
 
       if (
-        currentHistoryDay >=
-        HISTORY_DAYS
+        currentHistoryDay >= HISTORY_DAYS
       ) {
-
         currentHistoryDay = 0;
       }
 
-      historyEnergy[
-        currentHistoryDay
-      ] =
+      historyEnergy[currentHistoryDay] =
         dailyEnergyKWh;
 
-      historyDate[
-        currentHistoryDay
-      ] =
+      historyDate[currentHistoryDay] =
         getDateString();
 
       dailyEnergyKWh = 0;
 
-      lastDayNumber =
-        today;
+      lastDayNumber = today;
     }
   }
 
@@ -1289,8 +1200,7 @@ void updateEnergyTracking() {
 
     if (lastMonth == -1) {
 
-      lastMonth =
-        month;
+      lastMonth = month;
 
     } else if (
       month != lastMonth
@@ -1298,8 +1208,7 @@ void updateEnergyTracking() {
 
       monthlyEnergyKWh = 0;
 
-      lastMonth =
-        month;
+      lastMonth = month;
     }
   }
 }
@@ -1311,15 +1220,12 @@ void updateEnergyTracking() {
 void calculateBilling() {
 
   dailyBill =
-    dailyEnergyKWh *
-    tariff;
+    dailyEnergyKWh * tariff;
 
   monthlyBill =
-    monthlyEnergyKWh *
-    tariff;
+    monthlyEnergyKWh * tariff;
 
-  predictedMonthlyBill =
-    0;
+  predictedMonthlyBill = 0;
 
   struct tm timeinfo;
 
@@ -1353,14 +1259,9 @@ void energySavingLogic() {
 
   if (!relayControlEnabled) {
 
-    energySavingActive =
-      false;
-
-    savedPowerW =
-      0;
-
-    savingBaselinePowerW =
-      0;
+    energySavingActive = false;
+    savedPowerW = 0;
+    savingBaselinePowerW = 0;
 
     return;
   }
@@ -1371,13 +1272,11 @@ void energySavingLogic() {
     : totalPowerW;
 
   if (
-    controlPowerW >=
-    energySaveOnW &&
+    controlPowerW >= energySaveOnW &&
     !energySavingActive
   ) {
 
-    energySavingActive =
-      true;
+    energySavingActive = true;
 
     savingBaselinePowerW =
       controlPowerW;
@@ -1387,8 +1286,7 @@ void energySavingLogic() {
       false
     );
 
-    heaterWasAutomaticallyOff =
-      true;
+    heaterWasAutomaticallyOff = true;
 
     Serial.println(
       "ENERGY SAVING: Heater OFF"
@@ -1396,22 +1294,16 @@ void energySavingLogic() {
   }
 
   else if (
-    controlPowerW <=
-    energySaveOffW &&
+    controlPowerW <= energySaveOffW &&
     energySavingActive
   ) {
 
-    energySavingActive =
-      false;
+    energySavingActive = false;
 
-    savingBaselinePowerW =
-      0;
+    savingBaselinePowerW = 0;
+    savedPowerW = 0;
 
-    savedPowerW =
-      0;
-
-    heaterWasAutomaticallyOff =
-      false;
+    heaterWasAutomaticallyOff = false;
 
     Serial.println(
       "ENERGY SAVING: NORMAL"
@@ -1432,13 +1324,14 @@ void energySavingLogic() {
 
   } else {
 
-    savedPowerW =
-      0;
+    savedPowerW = 0;
   }
 }
 
 // ============================================================
 // HTML HEADER
+// IMPORTANT:
+// NO PAGE RELOAD HERE
 // ============================================================
 
 String htmlHeader(
@@ -1449,12 +1342,10 @@ String htmlHeader(
   String bg;
 
   if (
-    dashboardBackground ==
-    "solid"
+    dashboardBackground == "solid"
   ) {
 
-    bg =
-      "#07111f";
+    bg = "#07111f";
 
   } else {
 
@@ -1653,10 +1544,6 @@ String htmlHeader(
   html += "margin:0;";
   html += "}";
 
-  // ==========================================================
-  // 7 DAY HISTORY
-  // ==========================================================
-
   html += ".history-card{";
   html += "grid-column:span 2;";
   html += "padding:10px;";
@@ -1784,15 +1671,11 @@ String htmlHeader(
   html += "<div>";
 
   html += "<h1>";
-  html += htmlEscape(
-    dashboardTitle
-  );
+  html += htmlEscape(dashboardTitle);
   html += "</h1>";
 
   html += "<div class='site'>";
-  html += htmlEscape(
-    siteName
-  );
+  html += htmlEscape(siteName);
   html += "</div>";
 
   html += "</div>";
@@ -1806,30 +1689,13 @@ String htmlHeader(
   html += "<a href='/wifi'>WiFi</a>";
 
   html += "</div>";
-
   html += "</div>";
-
-  if (autoRefresh) {
-
-    html += "<script>";
-
-    html +=
-      "setTimeout(function(){location.reload();},";
-
-    html += String(
-      refreshSeconds * 1000
-    );
-
-    html += ");";
-
-    html += "</script>";
-  }
 
   return html;
 }
 
 // ============================================================
-// HTML FOOTER
+// FOOTER
 // ============================================================
 
 String htmlFooter() {
@@ -1856,7 +1722,7 @@ void handleDashboard() {
   String html =
     htmlHeader(
       dashboardTitle,
-      true
+      false
     );
 
   html += "<div class='grid'>";
@@ -1867,35 +1733,37 @@ void handleDashboard() {
 
   html += "<div class='card mainpower'>";
 
-  html += "<div class='label'>";
-  html += "TOTAL POWER";
+  html += "<div class='label'>TOTAL POWER</div>";
+
+  html += "<div id='totalPower' class='power'>";
+  html += formatPower(totalPowerW);
   html += "</div>";
 
-  html += "<div class='power'>";
-  html += formatPower(
-    totalPowerW
-  );
+  html += "<div id='wifiStatus' class='";
+
+  html += wifiConnected
+    ? "online"
+    : "warning";
+
+  html += "'>";
+
+  html += wifiConnected
+    ? "ONLINE"
+    : "SETUP MODE";
+
   html += "</div>";
 
-  if (wifiConnected) {
+  html += "<div id='highStatus' class='danger' style='";
 
-    html += "<div class='online'>";
-    html += "ONLINE";
-    html += "</div>";
+  html += highConsumption
+    ? ""
+    : "display:none;";
 
-  } else {
+  html += "'>";
 
-    html += "<div class='warning'>";
-    html += "SETUP MODE";
-    html += "</div>";
-  }
+  html += "HIGH CONSUMPTION";
 
-  if (highConsumption) {
-
-    html += "<div class='danger'>";
-    html += "HIGH CONSUMPTION";
-    html += "</div>";
-  }
+  html += "</div>";
 
   html += "</div>";
 
@@ -1907,25 +1775,19 @@ void handleDashboard() {
 
     html += "<div class='card'>";
 
-    html += "<div class='label'>";
-    html += "AC";
-    html += "</div>";
+    html += "<div class='label'>AC</div>";
 
-    html += "<div class='value'>";
-    html += formatPower(
-      acPower
-    );
+    html += "<div id='acPower' class='value'>";
+    html += formatPower(acPower);
     html += "</div>";
 
     if (showVoltage) {
 
       html += "<div class='small'>";
       html += "Voltage: ";
-      html += String(
-        acVoltage,
-        1
-      );
-      html += " V";
+      html += "<span id='acVoltage'>";
+      html += String(acVoltage, 1);
+      html += "</span> V";
       html += "</div>";
     }
 
@@ -1933,11 +1795,9 @@ void handleDashboard() {
 
       html += "<div class='small'>";
       html += "Current: ";
-      html += String(
-        acCurrent,
-        2
-      );
-      html += " A";
+      html += "<span id='acCurrent'>";
+      html += String(acCurrent, 2);
+      html += "</span> A";
       html += "</div>";
     }
 
@@ -1945,11 +1805,9 @@ void handleDashboard() {
 
       html += "<div class='small'>";
       html += "Energy: ";
-      html += String(
-        acEnergy,
-        3
-      );
-      html += " kWh";
+      html += "<span id='acEnergy'>";
+      html += String(acEnergy, 3);
+      html += "</span> kWh";
       html += "</div>";
     }
 
@@ -1964,25 +1822,19 @@ void handleDashboard() {
 
     html += "<div class='card'>";
 
-    html += "<div class='label'>";
-    html += "HEATER";
-    html += "</div>";
+    html += "<div class='label'>HEATER</div>";
 
-    html += "<div class='value'>";
-    html += formatPower(
-      heaterPower
-    );
+    html += "<div id='heaterPower' class='value'>";
+    html += formatPower(heaterPower);
     html += "</div>";
 
     if (showVoltage) {
 
       html += "<div class='small'>";
       html += "Voltage: ";
-      html += String(
-        heaterVoltage,
-        1
-      );
-      html += " V";
+      html += "<span id='heaterVoltage'>";
+      html += String(heaterVoltage, 1);
+      html += "</span> V";
       html += "</div>";
     }
 
@@ -1990,11 +1842,9 @@ void handleDashboard() {
 
       html += "<div class='small'>";
       html += "Current: ";
-      html += String(
-        heaterCurrent,
-        2
-      );
-      html += " A";
+      html += "<span id='heaterCurrent'>";
+      html += String(heaterCurrent, 2);
+      html += "</span> A";
       html += "</div>";
     }
 
@@ -2002,11 +1852,9 @@ void handleDashboard() {
 
       html += "<div class='small'>";
       html += "Energy: ";
-      html += String(
-        heaterEnergy,
-        3
-      );
-      html += " kWh";
+      html += "<span id='heaterEnergy'>";
+      html += String(heaterEnergy, 3);
+      html += "</span> kWh";
       html += "</div>";
     }
 
@@ -2021,25 +1869,19 @@ void handleDashboard() {
 
     html += "<div class='card'>";
 
-    html += "<div class='label'>";
-    html += "LIGHTS";
-    html += "</div>";
+    html += "<div class='label'>LIGHTS</div>";
 
-    html += "<div class='value'>";
-    html += formatPower(
-      lightsPower
-    );
+    html += "<div id='lightsPower' class='value'>";
+    html += formatPower(lightsPower);
     html += "</div>";
 
     if (showVoltage) {
 
       html += "<div class='small'>";
       html += "Voltage: ";
-      html += String(
-        lightsVoltage,
-        1
-      );
-      html += " V";
+      html += "<span id='lightsVoltage'>";
+      html += String(lightsVoltage, 1);
+      html += "</span> V";
       html += "</div>";
     }
 
@@ -2047,11 +1889,9 @@ void handleDashboard() {
 
       html += "<div class='small'>";
       html += "Current: ";
-      html += String(
-        lightsCurrent,
-        2
-      );
-      html += " A";
+      html += "<span id='lightsCurrent'>";
+      html += String(lightsCurrent, 2);
+      html += "</span> A";
       html += "</div>";
     }
 
@@ -2059,11 +1899,9 @@ void handleDashboard() {
 
       html += "<div class='small'>";
       html += "Energy: ";
-      html += String(
-        lightsEnergy,
-        3
-      );
-      html += " kWh";
+      html += "<span id='lightsEnergy'>";
+      html += String(lightsEnergy, 3);
+      html += "</span> kWh";
       html += "</div>";
     }
 
@@ -2071,8 +1909,7 @@ void handleDashboard() {
   }
 
   // ==========================================================
-  // 7 DAY HISTORY
-  // DAY NAME + DATE + ENERGY
+  // HISTORY
   // ==========================================================
 
   if (showHistory) {
@@ -2085,9 +1922,7 @@ void handleDashboard() {
     html += "7 DAY ENERGY HISTORY";
     html += "</div>";
 
-    html += "<div class='small'>";
-    html += "kWh";
-    html += "</div>";
+    html += "<div class='small'>kWh</div>";
 
     html += "</div>";
 
@@ -2098,53 +1933,46 @@ void handleDashboard() {
     html += "<th class='history-energy'>ENERGY</th>";
     html += "</tr>";
 
-    for (
-      int i = 0;
-      i < HISTORY_DAYS;
-      i++
-    ) {
+    for (int i = 0; i < HISTORY_DAYS; i++) {
 
       int index =
         (
           currentHistoryDay -
           i +
           HISTORY_DAYS
-        )
-        %
-        HISTORY_DAYS;
+        ) % HISTORY_DAYS;
 
       html += "<tr>";
 
       html += "<td>";
 
-      if (
-        historyDate[index].length() > 0
-      ) {
+      html += "<span id='historyDay";
+      html += String(i);
+      html += "' class='history-day'>";
 
-        html += "<span class='history-day'>";
-
-        html += getWeekdayName(
-          historyDate[index]
-        );
-
-        html += "</span>";
-
-        html += "<span class='history-date'>";
-
-        html += historyDate[index];
-
-        html += "</span>";
-
+      if (historyDate[index].length() > 0) {
+        html += getWeekdayName(historyDate[index]);
       } else {
-
-        html += "<span class='history-day'>";
         html += "-";
-        html += "</span>";
       }
+
+      html += "</span>";
+
+      html += "<span id='historyDate";
+      html += String(i);
+      html += "' class='history-date'>";
+
+      if (historyDate[index].length() > 0) {
+        html += historyDate[index];
+      }
+
+      html += "</span>";
 
       html += "</td>";
 
-      html += "<td class='history-energy'>";
+      html += "<td id='historyEnergy";
+      html += String(i);
+      html += "' class='history-energy'>";
 
       html += String(
         historyEnergy[index],
@@ -2159,7 +1987,6 @@ void handleDashboard() {
     }
 
     html += "</table>";
-
     html += "</div>";
   }
 
@@ -2175,52 +2002,39 @@ void handleDashboard() {
     html += "ENERGY & BILLING";
     html += "</div>";
 
-    html += "<div class='small'>";
-    html += "Today";
-    html += "</div>";
+    html += "<div class='small'>Today</div>";
 
-    html += "<div class='value'>";
-    html += String(
-      dailyEnergyKWh,
-      3
-    );
+    html += "<div id='dailyEnergy' class='value'>";
+    html += String(dailyEnergyKWh, 3);
     html += " kWh";
     html += "</div>";
 
     html += "<div class='small'>";
     html += "Daily Bill: ";
-    html += String(
-      dailyBill,
-      3
-    );
+    html += "<span id='dailyBill'>";
+    html += String(dailyBill, 3);
+    html += "</span>";
     html += "</div>";
 
-    html += "<div class='small'>";
-    html += "This Month";
-    html += "</div>";
+    html += "<div class='small'>This Month</div>";
 
-    html += "<div class='value'>";
-    html += String(
-      monthlyEnergyKWh,
-      3
-    );
+    html += "<div id='monthlyEnergy' class='value'>";
+    html += String(monthlyEnergyKWh, 3);
     html += " kWh";
     html += "</div>";
 
     html += "<div class='small'>";
     html += "Monthly Bill: ";
-    html += String(
-      monthlyBill,
-      3
-    );
+    html += "<span id='monthlyBill'>";
+    html += String(monthlyBill, 3);
+    html += "</span>";
     html += "</div>";
 
     html += "<div class='small'>";
     html += "Predicted: ";
-    html += String(
-      predictedMonthlyBill,
-      3
-    );
+    html += "<span id='predictedBill'>";
+    html += String(predictedMonthlyBill, 3);
+    html += "</span>";
     html += "</div>";
 
     html += "</div>";
@@ -2234,9 +2048,9 @@ void handleDashboard() {
 
     html += "<div class='card dashboard-small'>";
 
-    html += "<div class='label'>";
-    html += "ENERGY SAVING";
-    html += "</div>";
+    html += "<div class='label'>ENERGY SAVING</div>";
+
+    html += "<div id='savingStatus'>";
 
     if (!relayControlEnabled) {
 
@@ -2258,11 +2072,9 @@ void handleDashboard() {
 
         html += "<div class='small'>";
         html += "Estimated saving: ";
-        html += String(
-          savedPowerW,
-          0
-        );
-        html += " W";
+        html += "<span id='savedPower'>";
+        html += String(savedPowerW, 0);
+        html += "</span> W";
         html += "</div>";
       }
 
@@ -2277,14 +2089,13 @@ void handleDashboard() {
 
       html += "<div class='small'>";
       html += "TEST MODE: ";
-      html += String(
-        testPowerW,
-        0
-      );
-      html += " W";
+      html += "<span id='testPower'>";
+      html += String(testPowerW, 0);
+      html += "</span> W";
       html += "</div>";
     }
 
+    html += "</div>";
     html += "</div>";
   }
 
@@ -2294,40 +2105,242 @@ void handleDashboard() {
 
   html += "<div class='card dashboard-small'>";
 
-  html += "<div class='label'>";
-  html += "SYSTEM STATUS";
-  html += "</div>";
+  html += "<div class='label'>SYSTEM STATUS</div>";
 
   html += "<div class='small'>";
   html += "Date: ";
+  html += "<span id='systemDate'>";
   html += getDateString();
+  html += "</span>";
   html += "</div>";
 
   html += "<div class='small'>";
   html += "Time: ";
+  html += "<span id='systemTime'>";
   html += getTimeString();
+  html += "</span>";
   html += "</div>";
 
   html += "<div class='small'>";
   html += "Tariff: ";
-  html += String(
-    tariff,
-    3
-  );
+  html += "<span id='systemTariff'>";
+  html += String(tariff, 3);
+  html += "</span>";
   html += "</div>";
 
   html += "<div class='small'>";
   html += "High limit: ";
-  html += String(
-    highPowerLimitW,
-    0
-  );
-  html += " W";
+  html += "<span id='highLimit'>";
+  html += String(highPowerLimitW, 0);
+  html += "</span> W";
   html += "</div>";
 
   html += "</div>";
 
   html += "</div>";
+
+  // ==========================================================
+  // LIVE DASHBOARD JAVASCRIPT
+  // ==========================================================
+
+  html += "<script>";
+
+  html += "const refreshMs=";
+  html += String(refreshSeconds * 1000);
+  html += ";";
+
+  html += "function powerText(w){";
+  html += "w=Number(w)||0;";
+  html += "return '";
+  html += powerUnit;
+  html += "'==='W' ? Math.round(w)+' W' : (w/1000).toFixed(2)+' kW';";
+  html += "}";
+
+  html += "function setText(id,value){";
+  html += "const e=document.getElementById(id);";
+  html += "if(e)e.textContent=value;";
+  html += "}";
+
+  html += "async function updateDashboard(){";
+
+  html += "try{";
+
+  html +=
+    "const r=await fetch('/api',{cache:'no-store'});";
+
+  html += "if(!r.ok)return;";
+
+  html += "const d=await r.json();";
+
+  // Power
+  html +=
+    "setText('totalPower',powerText(d.totalPowerW));";
+
+  html +=
+    "setText('acPower',powerText(d.acPower));";
+
+  html +=
+    "setText('heaterPower',powerText(d.heaterPower));";
+
+  html +=
+    "setText('lightsPower',powerText(d.lightsPower));";
+
+  // Voltage
+  html +=
+    "setText('acVoltage',Number(d.acVoltage).toFixed(1));";
+
+  html +=
+    "setText('heaterVoltage',Number(d.heaterVoltage).toFixed(1));";
+
+  html +=
+    "setText('lightsVoltage',Number(d.lightsVoltage).toFixed(1));";
+
+  // Current
+  html +=
+    "setText('acCurrent',Number(d.acCurrent).toFixed(2));";
+
+  html +=
+    "setText('heaterCurrent',Number(d.heaterCurrent).toFixed(2));";
+
+  html +=
+    "setText('lightsCurrent',Number(d.lightsCurrent).toFixed(2));";
+
+  // Energy
+  html +=
+    "setText('acEnergy',Number(d.acEnergy).toFixed(3));";
+
+  html +=
+    "setText('heaterEnergy',Number(d.heaterEnergy).toFixed(3));";
+
+  html +=
+    "setText('lightsEnergy',Number(d.lightsEnergy).toFixed(3));";
+
+  // Billing
+  html +=
+    "setText('dailyEnergy',Number(d.dailyEnergy).toFixed(3)+' kWh');";
+
+  html +=
+    "setText('monthlyEnergy',Number(d.monthlyEnergy).toFixed(3)+' kWh');";
+
+  html +=
+    "setText('dailyBill',Number(d.dailyBill).toFixed(3));";
+
+  html +=
+    "setText('monthlyBill',Number(d.monthlyBill).toFixed(3));";
+
+  html +=
+    "setText('predictedBill',Number(d.predictedBill).toFixed(3));";
+
+  // System
+  html +=
+    "setText('systemDate',d.date);";
+
+  html +=
+    "setText('systemTime',d.time);";
+
+  html +=
+    "setText('systemTariff',Number(d.tariff).toFixed(3));";
+
+  html +=
+    "setText('highLimit',Number(d.highPowerLimitW).toFixed(0));";
+
+  // WiFi
+  html +=
+    "const ws=document.getElementById('wifiStatus');";
+
+  html += "if(ws){";
+
+  html +=
+    "ws.textContent=d.wifiConnected?'ONLINE':'SETUP MODE';";
+
+  html +=
+    "ws.className=d.wifiConnected?'online':'warning';";
+
+  html += "}";
+
+  // High consumption
+  html +=
+    "const hs=document.getElementById('highStatus');";
+
+  html += "if(hs){";
+
+  html +=
+    "hs.style.display=d.highConsumption?'block':'none';";
+
+  html += "}";
+
+  // Energy saving
+  html +=
+    "const ss=document.getElementById('savingStatus');";
+
+  html += "if(ss){";
+
+  html += "let s='';";
+
+  html +=
+    "if(!d.relayControl){";
+
+  html +=
+    "s=\"<div class='warning'>RELAY CONTROL DISABLED</div>\";";
+
+  html += "}else if(d.energySaving){";
+
+  html +=
+    "s=\"<div class='danger'>ENERGY SAVING ACTIVE</div>\";";
+
+  html +=
+    "s+=\"<div class='small'>Heater automatically OFF</div>\";";
+
+  html +=
+    "if(!d.testMode)s+=\"<div class='small'>Estimated saving: \"+Number(d.savedPowerW).toFixed(0)+\" W</div>\";";
+
+  html += "}else{";
+
+  html +=
+    "s=\"<div class='online'>NORMAL</div>\";";
+
+  html += "}";
+
+  html +=
+    "if(d.testMode)s+=\"<div class='small'>TEST MODE: \"+Number(d.testPowerW).toFixed(0)+\" W</div>\";";
+
+  html +=
+    "ss.innerHTML=s;";
+
+  html += "}";
+
+  // History
+  html +=
+    "if(d.history){";
+
+  html += "for(let i=0;i<7;i++){";
+
+  html +=
+    "setText('historyDay'+i,d.history[i].day);";
+
+  html +=
+    "setText('historyDate'+i,d.history[i].date);";
+
+  html +=
+    "setText('historyEnergy'+i,Number(d.history[i].energy).toFixed(3)+' kWh');";
+
+  html += "}";
+
+  html += "}";
+
+  html += "}catch(e){";
+
+  html += "console.log('Dashboard update error',e);";
+
+  html += "}";
+
+  html += "}";
+
+  html += "updateDashboard();";
+
+  html += "setInterval(updateDashboard,refreshMs);";
+
+  html += "</script>";
 
   html += htmlFooter();
 
@@ -2347,82 +2360,141 @@ void handleAPI() {
   String json = "{";
 
   json += "\"totalPowerW\":";
-  json += String(
-    totalPowerW,
-    2
-  );
+  json += String(totalPowerW, 2);
 
   json += ",\"acPower\":";
-  json += String(
-    acPower,
-    2
-  );
+  json += String(acPower, 2);
+
+  json += ",\"acVoltage\":";
+  json += String(acVoltage, 1);
+
+  json += ",\"acCurrent\":";
+  json += String(acCurrent, 2);
+
+  json += ",\"acEnergy\":";
+  json += String(acEnergy, 3);
 
   json += ",\"heaterPower\":";
-  json += String(
-    heaterPower,
-    2
-  );
+  json += String(heaterPower, 2);
+
+  json += ",\"heaterVoltage\":";
+  json += String(heaterVoltage, 1);
+
+  json += ",\"heaterCurrent\":";
+  json += String(heaterCurrent, 2);
+
+  json += ",\"heaterEnergy\":";
+  json += String(heaterEnergy, 3);
 
   json += ",\"lightsPower\":";
-  json += String(
-    lightsPower,
-    2
-  );
+  json += String(lightsPower, 2);
+
+  json += ",\"lightsVoltage\":";
+  json += String(lightsVoltage, 1);
+
+  json += ",\"lightsCurrent\":";
+  json += String(lightsCurrent, 2);
+
+  json += ",\"lightsEnergy\":";
+  json += String(lightsEnergy, 3);
 
   json += ",\"dailyEnergy\":";
-  json += String(
-    dailyEnergyKWh,
-    3
-  );
+  json += String(dailyEnergyKWh, 3);
 
   json += ",\"monthlyEnergy\":";
-  json += String(
-    monthlyEnergyKWh,
-    3
-  );
+  json += String(monthlyEnergyKWh, 3);
 
   json += ",\"dailyBill\":";
-  json += String(
-    dailyBill,
-    3
-  );
+  json += String(dailyBill, 3);
 
   json += ",\"monthlyBill\":";
-  json += String(
-    monthlyBill,
-    3
-  );
+  json += String(monthlyBill, 3);
 
   json += ",\"predictedBill\":";
-  json += String(
-    predictedMonthlyBill,
-    3
-  );
+  json += String(predictedMonthlyBill, 3);
 
   json += ",\"energySaving\":";
-  json +=
-    energySavingActive
-    ? "true"
-    : "false";
+  json += energySavingActive ? "true" : "false";
 
   json += ",\"relayControl\":";
-  json +=
-    relayControlEnabled
-    ? "true"
-    : "false";
+  json += relayControlEnabled ? "true" : "false";
 
   json += ",\"testMode\":";
-  json +=
-    energySavingTestMode
-    ? "true"
-    : "false";
+  json += energySavingTestMode ? "true" : "false";
 
   json += ",\"highConsumption\":";
-  json +=
-    highConsumption
-    ? "true"
-    : "false";
+  json += highConsumption ? "true" : "false";
+
+  json += ",\"wifiConnected\":";
+  json += wifiConnected ? "true" : "false";
+
+  json += ",\"savedPowerW\":";
+  json += String(savedPowerW, 0);
+
+  json += ",\"testPowerW\":";
+  json += String(testPowerW, 0);
+
+  json += ",\"tariff\":";
+  json += String(tariff, 3);
+
+  json += ",\"highPowerLimitW\":";
+  json += String(highPowerLimitW, 0);
+
+  json += ",\"date\":\"";
+  json += getDateString();
+  json += "\"";
+
+  json += ",\"time\":\"";
+  json += getTimeString();
+  json += "\"";
+
+  // ==========================================================
+  // HISTORY
+  // ==========================================================
+
+  json += ",\"history\":[";
+
+  for (int i = 0; i < HISTORY_DAYS; i++) {
+
+    int index =
+      (
+        currentHistoryDay -
+        i +
+        HISTORY_DAYS
+      ) % HISTORY_DAYS;
+
+    if (i > 0) {
+      json += ",";
+    }
+
+    json += "{";
+
+    json += "\"day\":\"";
+
+    if (historyDate[index].length() > 0) {
+      json += getWeekdayName(
+        historyDate[index]
+      );
+    } else {
+      json += "-";
+    }
+
+    json += "\"";
+
+    json += ",\"date\":\"";
+    json += historyDate[index];
+    json += "\"";
+
+    json += ",\"energy\":";
+    json += String(
+      historyEnergy[index],
+      3
+    );
+
+    json += "}";
+  }
+
+  json += "]";
 
   json += "}";
 
@@ -2434,15 +2506,13 @@ void handleAPI() {
 }
 
 // ============================================================
-// CONTROLS PAGE
+// CONTROLS
 // ============================================================
 
 void handleControls() {
 
   String html =
-    htmlHeader(
-      "Controls"
-    );
+    htmlHeader("Controls");
 
   html += "<div class='card'>";
 
@@ -2452,15 +2522,11 @@ void handleControls() {
 
   if (relayControlEnabled) {
 
-    html += "<span class='online'>";
-    html += "ENABLED";
-    html += "</span>";
+    html += "<span class='online'>ENABLED</span>";
 
   } else {
 
-    html += "<span class='warning'>";
-    html += "DISABLED";
-    html += "</span>";
+    html += "<span class='warning'>DISABLED</span>";
   }
 
   html += "</p>";
@@ -2469,9 +2535,7 @@ void handleControls() {
     "<a class='btn' href='/relay-enable?state=";
 
   html +=
-    relayControlEnabled
-    ? "0"
-    : "1";
+    relayControlEnabled ? "0" : "1";
 
   html += "'>";
 
@@ -2485,11 +2549,9 @@ void handleControls() {
   html += "</div>";
 
   html += "<br>";
-
   html += "<div class='grid'>";
 
   // AC
-
   html += "<div class='card'>";
 
   html += "<h3>AC</h3>";
@@ -2511,8 +2573,7 @@ void handleControls() {
 
   html += "</div>";
 
-  // HEATER
-
+  // Heater
   html += "<div class='card'>";
 
   html += "<h3>Heater</h3>";
@@ -2534,8 +2595,7 @@ void handleControls() {
 
   html += "</div>";
 
-  // LIGHTS
-
+  // Lights
   html += "<div class='card'>";
 
   html += "<h3>Lights</h3>";
@@ -2558,11 +2618,9 @@ void handleControls() {
   html += "</div>";
 
   html += "</div>";
-
   html += "<br>";
 
-  // TEST
-
+  // Test
   html += "<div class='card'>";
 
   html += "<h2>Energy Saving Test</h2>";
@@ -2573,33 +2631,18 @@ void handleControls() {
 
   html += "<p>";
   html += "Current test power: ";
-  html += String(
-    testPowerW,
-    0
-  );
+  html += String(testPowerW, 0);
   html += " W";
   html += "</p>";
 
   html +=
-    "<a class='btn' href='/autosave-test?state=1'>";
-
-  html += "TEST HIGH LOAD";
-
-  html += "</a> ";
+    "<a class='btn' href='/autosave-test?state=1'>TEST HIGH LOAD</a> ";
 
   html +=
-    "<a class='btn' href='/autosave-test?state=2'>";
-
-  html += "TEST LOW LOAD";
-
-  html += "</a> ";
+    "<a class='btn' href='/autosave-test?state=2'>TEST LOW LOAD</a> ";
 
   html +=
-    "<a class='btn secondary' href='/autosave-test?state=0'>";
-
-  html += "STOP TEST";
-
-  html += "</a>";
+    "<a class='btn secondary' href='/autosave-test?state=0'>STOP TEST</a>";
 
   html += "</div>";
 
@@ -2621,22 +2664,14 @@ void handleRelayEnable() {
   if (server.hasArg("state")) {
 
     relayControlEnabled =
-      server.arg("state") ==
-      "1";
+      server.arg("state") == "1";
 
     if (!relayControlEnabled) {
 
-      energySavingActive =
-        false;
-
-      energySavingTestMode =
-        false;
-
-      savedPowerW =
-        0;
-
-      savingBaselinePowerW =
-        0;
+      energySavingActive = false;
+      energySavingTestMode = false;
+      savedPowerW = 0;
+      savingBaselinePowerW = 0;
     }
   }
 
@@ -2645,9 +2680,7 @@ void handleRelayEnable() {
     "/controls"
   );
 
-  server.send(
-    303
-  );
+  server.send(303);
 }
 
 // ============================================================
@@ -2682,14 +2715,10 @@ void handleRelay() {
   }
 
   int pin =
-    server.arg(
-      "pin"
-    ).toInt();
+    server.arg("pin").toInt();
 
   int state =
-    server.arg(
-      "state"
-    ).toInt();
+    server.arg("state").toInt();
 
   if (
     pin != RELAY_AC_PIN &&
@@ -2717,9 +2746,7 @@ void handleRelay() {
     "/controls"
   );
 
-  server.send(
-    303
-  );
+  server.send(303);
 }
 
 // ============================================================
@@ -2751,39 +2778,24 @@ void handleAutoSaveTest() {
   }
 
   int state =
-    server.arg(
-      "state"
-    ).toInt();
+    server.arg("state").toInt();
 
   if (state == 1) {
 
-    energySavingTestMode =
-      true;
-
-    testPowerW =
-      3500.0f;
+    energySavingTestMode = true;
+    testPowerW = 3500.0f;
 
   } else if (state == 2) {
 
-    energySavingTestMode =
-      true;
-
-    testPowerW =
-      2000.0f;
+    energySavingTestMode = true;
+    testPowerW = 2000.0f;
 
   } else {
 
-    energySavingTestMode =
-      false;
-
-    energySavingActive =
-      false;
-
-    savedPowerW =
-      0;
-
-    savingBaselinePowerW =
-      0;
+    energySavingTestMode = false;
+    energySavingActive = false;
+    savedPowerW = 0;
+    savingBaselinePowerW = 0;
   }
 
   energySavingLogic();
@@ -2793,21 +2805,17 @@ void handleAutoSaveTest() {
     "/controls"
   );
 
-  server.send(
-    303
-  );
+  server.send(303);
 }
 
 // ============================================================
-// SETTINGS PAGE
+// SETTINGS
 // ============================================================
 
 void handleSettings() {
 
   String html =
-    htmlHeader(
-      "System Settings"
-    );
+    htmlHeader("System Settings");
 
   html += "<div class='card'>";
 
@@ -2821,10 +2829,7 @@ void handleSettings() {
   html +=
     "<input type='number' step='0.001' name='tariff' value='";
 
-  html += String(
-    tariff,
-    3
-  );
+  html += String(tariff, 3);
 
   html += "'>";
 
@@ -2834,10 +2839,7 @@ void handleSettings() {
   html +=
     "<input type='number' name='highlimit' value='";
 
-  html += String(
-    highPowerLimitW,
-    0
-  );
+  html += String(highPowerLimitW, 0);
 
   html += "'>";
 
@@ -2847,10 +2849,7 @@ void handleSettings() {
   html +=
     "<input type='number' name='saveon' value='";
 
-  html += String(
-    energySaveOnW,
-    0
-  );
+  html += String(energySaveOnW, 0);
 
   html += "'>";
 
@@ -2860,10 +2859,7 @@ void handleSettings() {
   html +=
     "<input type='number' name='saveoff' value='";
 
-  html += String(
-    energySaveOffW,
-    0
-  );
+  html += String(energySaveOffW, 0);
 
   html += "'>";
 
@@ -2871,9 +2867,7 @@ void handleSettings() {
     "<button type='submit'>SAVE SETTINGS</button>";
 
   html += "</form>";
-
   html += "</div>";
-
   html += "<br>";
 
   html += "<div class='card'>";
@@ -2881,12 +2875,7 @@ void handleSettings() {
   html += "<h2>Data</h2>";
 
   html +=
-    "<a class='btn secondary' href='/reset'>";
-
-  html +=
-    "Reset Energy Data";
-
-  html += "</a>";
+    "<a class='btn secondary' href='/reset'>RESET ENERGY DATA</a>";
 
   html += "</div>";
 
@@ -2906,35 +2895,23 @@ void handleSettings() {
 void handleSettingsSave() {
 
   if (server.hasArg("tariff")) {
-
     tariff =
-      server.arg(
-        "tariff"
-      ).toFloat();
+      server.arg("tariff").toFloat();
   }
 
   if (server.hasArg("highlimit")) {
-
     highPowerLimitW =
-      server.arg(
-        "highlimit"
-      ).toFloat();
+      server.arg("highlimit").toFloat();
   }
 
   if (server.hasArg("saveon")) {
-
     energySaveOnW =
-      server.arg(
-        "saveon"
-      ).toFloat();
+      server.arg("saveon").toFloat();
   }
 
   if (server.hasArg("saveoff")) {
-
     energySaveOffW =
-      server.arg(
-        "saveoff"
-      ).toFloat();
+      server.arg("saveoff").toFloat();
   }
 
   saveSystemSettings();
@@ -2944,26 +2921,21 @@ void handleSettingsSave() {
     "/settings"
   );
 
-  server.send(
-    303
-  );
+  server.send(303);
 }
 
 // ============================================================
-// DASHBOARD DESIGNER
+// DESIGNER
 // ============================================================
 
 void handleDesign() {
 
   String html =
-    htmlHeader(
-      "Dashboard Designer"
-    );
+    htmlHeader("Dashboard Designer");
 
   html += "<div class='card'>";
 
-  html +=
-    "<h2>Dashboard Designer</h2>";
+  html += "<h2>Dashboard Designer</h2>";
 
   html +=
     "<form method='POST' action='/design-save'>";
@@ -2973,146 +2945,83 @@ void handleDesign() {
   html +=
     "<input name='title' value='";
 
-  html +=
-    htmlEscape(
-      dashboardTitle
-    );
+  html += htmlEscape(dashboardTitle);
 
   html += "'>";
 
-  html +=
-    "<label>Site / Company Name</label>";
+  html += "<label>Site / Company Name</label>";
 
   html +=
     "<input name='site' value='";
 
-  html +=
-    htmlEscape(
-      siteName
-    );
+  html += htmlEscape(siteName);
 
   html += "'>";
 
   html += "<label>Theme</label>";
 
-  html +=
-    "<select name='theme'>";
+  html += "<select name='theme'>";
 
   html +=
-    "<option value='blue'";
+    "<option value='blue'" +
+    selected(dashboardTheme == "blue") +
+    ">Blue</option>";
 
   html +=
-    selected(
-      dashboardTheme ==
-      "blue"
-    );
-
-  html += ">Blue</option>";
+    "<option value='dark'" +
+    selected(dashboardTheme == "dark") +
+    ">Dark</option>";
 
   html +=
-    "<option value='dark'";
+    "<option value='light'" +
+    selected(dashboardTheme == "light") +
+    ">Light</option>";
 
   html +=
-    selected(
-      dashboardTheme ==
-      "dark"
-    );
-
-  html += ">Dark</option>";
-
-  html +=
-    "<option value='light'";
-
-  html +=
-    selected(
-      dashboardTheme ==
-      "light"
-    );
-
-  html += ">Light</option>";
-
-  html +=
-    "<option value='custom'";
-
-  html +=
-    selected(
-      dashboardTheme ==
-      "custom"
-    );
-
-  html += ">Custom</option>";
+    "<option value='custom'" +
+    selected(dashboardTheme == "custom") +
+    ">Custom</option>";
 
   html += "</select>";
 
-  html +=
-    "<label>Accent Color</label>";
+  html += "<label>Accent Color</label>";
 
   html +=
     "<input type='text' name='accent' value='";
 
-  html +=
-    htmlEscape(
-      dashboardAccent
-    );
+  html += htmlEscape(dashboardAccent);
 
   html += "'>";
 
-  html +=
-    "<label>Background</label>";
+  html += "<label>Background</label>";
+
+  html += "<select name='background'>";
 
   html +=
-    "<select name='background'>";
+    "<option value='gradient'" +
+    selected(dashboardBackground == "gradient") +
+    ">Gradient</option>";
 
   html +=
-    "<option value='gradient'";
-
-  html +=
-    selected(
-      dashboardBackground ==
-      "gradient"
-    );
-
-  html += ">Gradient</option>";
-
-  html +=
-    "<option value='solid'";
-
-  html +=
-    selected(
-      dashboardBackground ==
-      "solid"
-    );
-
-  html += ">Solid</option>";
+    "<option value='solid'" +
+    selected(dashboardBackground == "solid") +
+    ">Solid</option>";
 
   html += "</select>";
 
   html += "<label>Layout</label>";
 
-  html +=
-    "<select name='density'>";
+  html += "<select name='density'>";
 
   html +=
-    "<option value='compact'";
+    "<option value='compact'" +
+    selected(dashboardDensity == "compact") +
+    ">Compact</option>";
 
   html +=
-    selected(
-      dashboardDensity ==
-      "compact"
-    );
-
-  html += ">Compact</option>";
-
-  html +=
-    "<option value='normal'";
-
-  html +=
-    selected(
-      dashboardDensity ==
-      "normal"
-    );
-
-  html += ">Normal</option>";
+    "<option value='normal'" +
+    selected(dashboardDensity == "normal") +
+    ">Normal</option>";
 
   html += "</select>";
 
@@ -3121,50 +3030,32 @@ void handleDesign() {
   html +=
     "<input type='number' name='radius' value='";
 
-  html += String(
-    dashboardRadius
-  );
+  html += String(dashboardRadius);
 
   html += "'>";
 
   html += "<label>Power Unit</label>";
 
-  html +=
-    "<select name='unit'>";
+  html += "<select name='unit'>";
 
   html +=
-    "<option value='kW'";
+    "<option value='kW'" +
+    selected(powerUnit == "kW") +
+    ">kW</option>";
 
   html +=
-    selected(
-      powerUnit ==
-      "kW"
-    );
-
-  html += ">kW</option>";
-
-  html +=
-    "<option value='W'";
-
-  html +=
-    selected(
-      powerUnit ==
-      "W"
-    );
-
-  html += ">W</option>";
+    "<option value='W'" +
+    selected(powerUnit == "W") +
+    ">W</option>";
 
   html += "</select>";
 
-  html +=
-    "<label>Refresh Seconds</label>";
+  html += "<label>Refresh Seconds</label>";
 
   html +=
     "<input type='number' name='refresh' min='1' max='60' value='";
 
-  html += String(
-    refreshSeconds
-  );
+  html += String(refreshSeconds);
 
   html += "'>";
 
@@ -3172,68 +3063,50 @@ void handleDesign() {
 
   html += "<h3>Show / Hide</h3>";
 
-  html += "<div class='check'>";
   html +=
-    "<input type='checkbox' name='showac'";
-  html += checked(showAC);
-  html += "> AC";
-  html += "</div>";
+    "<div class='check'><input type='checkbox' name='showac'" +
+    checked(showAC) +
+    "> AC</div>";
 
-  html += "<div class='check'>";
   html +=
-    "<input type='checkbox' name='showheater'";
-  html += checked(showHeater);
-  html += "> Heater";
-  html += "</div>";
+    "<div class='check'><input type='checkbox' name='showheater'" +
+    checked(showHeater) +
+    "> Heater</div>";
 
-  html += "<div class='check'>";
   html +=
-    "<input type='checkbox' name='showlights'";
-  html += checked(showLights);
-  html += "> Lights";
-  html += "</div>";
+    "<div class='check'><input type='checkbox' name='showlights'" +
+    checked(showLights) +
+    "> Lights</div>";
 
-  html += "<div class='check'>";
   html +=
-    "<input type='checkbox' name='voltage'";
-  html += checked(showVoltage);
-  html += "> Voltage";
-  html += "</div>";
+    "<div class='check'><input type='checkbox' name='voltage'" +
+    checked(showVoltage) +
+    "> Voltage</div>";
 
-  html += "<div class='check'>";
   html +=
-    "<input type='checkbox' name='current'";
-  html += checked(showCurrent);
-  html += "> Current";
-  html += "</div>";
+    "<div class='check'><input type='checkbox' name='current'" +
+    checked(showCurrent) +
+    "> Current</div>";
 
-  html += "<div class='check'>";
   html +=
-    "<input type='checkbox' name='energy'";
-  html += checked(showEnergy);
-  html += "> Energy";
-  html += "</div>";
+    "<div class='check'><input type='checkbox' name='energy'" +
+    checked(showEnergy) +
+    "> Energy</div>";
 
-  html += "<div class='check'>";
   html +=
-    "<input type='checkbox' name='billing'";
-  html += checked(showBilling);
-  html += "> Billing";
-  html += "</div>";
+    "<div class='check'><input type='checkbox' name='billing'" +
+    checked(showBilling) +
+    "> Billing</div>";
 
-  html += "<div class='check'>";
   html +=
-    "<input type='checkbox' name='history'";
-  html += checked(showHistory);
-  html += "> 7-Day History";
-  html += "</div>";
+    "<div class='check'><input type='checkbox' name='history'" +
+    checked(showHistory) +
+    "> 7-Day History</div>";
 
-  html += "<div class='check'>";
   html +=
-    "<input type='checkbox' name='saving'";
-  html += checked(showEnergySaving);
-  html += "> Energy Saving";
-  html += "</div>";
+    "<div class='check'><input type='checkbox' name='saving'" +
+    checked(showEnergySaving) +
+    "> Energy Saving</div>";
 
   html += "<br>";
 
@@ -3241,7 +3114,6 @@ void handleDesign() {
     "<button type='submit'>SAVE DESIGN</button>";
 
   html += "</form>";
-
   html += "</div>";
 
   html += htmlFooter();
@@ -3260,104 +3132,52 @@ void handleDesign() {
 void handleDesignSave() {
 
   if (server.hasArg("title"))
-    dashboardTitle =
-      server.arg("title");
+    dashboardTitle = server.arg("title");
 
   if (server.hasArg("site"))
-    siteName =
-      server.arg("site");
+    siteName = server.arg("site");
 
   if (server.hasArg("theme"))
-    dashboardTheme =
-      server.arg("theme");
+    dashboardTheme = server.arg("theme");
 
   if (server.hasArg("accent"))
-    dashboardAccent =
-      server.arg("accent");
+    dashboardAccent = server.arg("accent");
 
   if (server.hasArg("background"))
-    dashboardBackground =
-      server.arg("background");
+    dashboardBackground = server.arg("background");
 
   if (server.hasArg("density"))
-    dashboardDensity =
-      server.arg("density");
+    dashboardDensity = server.arg("density");
 
   if (server.hasArg("radius"))
-    dashboardRadius =
-      server.arg("radius").toInt();
+    dashboardRadius = server.arg("radius").toInt();
 
   if (server.hasArg("unit"))
-    powerUnit =
-      server.arg("unit");
+    powerUnit = server.arg("unit");
 
   if (server.hasArg("refresh"))
-    refreshSeconds =
-      server.arg("refresh").toInt();
+    refreshSeconds = server.arg("refresh").toInt();
 
-  showAC =
-    server.hasArg(
-      "showac"
-    );
+  showAC = server.hasArg("showac");
+  showHeater = server.hasArg("showheater");
+  showLights = server.hasArg("showlights");
+  showVoltage = server.hasArg("voltage");
+  showCurrent = server.hasArg("current");
+  showEnergy = server.hasArg("energy");
+  showBilling = server.hasArg("billing");
+  showHistory = server.hasArg("history");
+  showEnergySaving = server.hasArg("saving");
 
-  showHeater =
-    server.hasArg(
-      "showheater"
-    );
-
-  showLights =
-    server.hasArg(
-      "showlights"
-    );
-
-  showVoltage =
-    server.hasArg(
-      "voltage"
-    );
-
-  showCurrent =
-    server.hasArg(
-      "current"
-    );
-
-  showEnergy =
-    server.hasArg(
-      "energy"
-    );
-
-  showBilling =
-    server.hasArg(
-      "billing"
-    );
-
-  showHistory =
-    server.hasArg(
-      "history"
-    );
-
-  showEnergySaving =
-    server.hasArg(
-      "saving"
-    );
-
-  if (
-    refreshSeconds < 1
-  )
+  if (refreshSeconds < 1)
     refreshSeconds = 1;
 
-  if (
-    refreshSeconds > 60
-  )
+  if (refreshSeconds > 60)
     refreshSeconds = 60;
 
-  if (
-    dashboardRadius < 0
-  )
+  if (dashboardRadius < 0)
     dashboardRadius = 0;
 
-  if (
-    dashboardRadius > 40
-  )
+  if (dashboardRadius > 40)
     dashboardRadius = 40;
 
   saveDashboardSettings();
@@ -3367,9 +3187,7 @@ void handleDesignSave() {
     "/design"
   );
 
-  server.send(
-    303
-  );
+  server.send(303);
 }
 
 // ============================================================
@@ -3379,9 +3197,7 @@ void handleDesignSave() {
 void handleWiFi() {
 
   String html =
-    htmlHeader(
-      "WiFi Setup"
-    );
+    htmlHeader("WiFi Setup");
 
   html += "<div class='card'>";
 
@@ -3411,29 +3227,21 @@ void handleWiFi() {
   html +=
     "<form method='POST' action='/wifi-save'>";
 
-  html +=
-    "<label>WiFi SSID</label>";
+  html += "<label>WiFi SSID</label>";
 
   html +=
     "<input name='ssid' value='";
 
-  html +=
-    htmlEscape(
-      savedSSID
-    );
+  html += htmlEscape(savedSSID);
 
   html += "'>";
 
-  html +=
-    "<label>WiFi Password</label>";
+  html += "<label>WiFi Password</label>";
 
   html +=
     "<input type='password' name='pass' value='";
 
-  html +=
-    htmlEscape(
-      savedPassword
-    );
+  html += htmlEscape(savedPassword);
 
   html += "'>";
 
@@ -3444,14 +3252,9 @@ void handleWiFi() {
 
   html += "<hr>";
 
-  html +=
-    "<p>Setup AP: Smart-Energy-Setup</p>";
-
-  html +=
-    "<p>Password: 12345678</p>";
-
-  html +=
-    "<p>Setup IP: 192.168.4.1</p>";
+  html += "<p>Setup AP: Smart-Energy-Setup</p>";
+  html += "<p>Password: 12345678</p>";
+  html += "<p>Setup IP: 192.168.4.1</p>";
 
   html += "</div>";
 
@@ -3482,18 +3285,13 @@ void handleWiFiSave() {
   }
 
   String ssid =
-    server.arg(
-      "ssid"
-    );
+    server.arg("ssid");
 
   String pass = "";
 
   if (server.hasArg("pass")) {
-
     pass =
-      server.arg(
-        "pass"
-      );
+      server.arg("pass");
   }
 
   saveWiFiSettings(
@@ -3519,42 +3317,31 @@ void handleWiFiSave() {
 void handlePZEM() {
 
   String html =
-    htmlHeader(
-      "PZEM Commissioning"
-    );
+    htmlHeader("PZEM Commissioning");
 
   html += "<div class='card'>";
 
-  html +=
-    "<h2>PZEM Commissioning</h2>";
+  html += "<h2>PZEM Commissioning</h2>";
 
   html +=
     "<p>Connect only ONE PZEM during address assignment.</p>";
 
-  html +=
-    "<p>Existing addresses:</p>";
+  html += "<p>Existing addresses:</p>";
 
   html += "<ul>";
 
-  html +=
-    "<li>AC = 0x01</li>";
-
-  html +=
-    "<li>Heater = 0x02</li>";
-
-  html +=
-    "<li>Lights = 0x03</li>";
+  html += "<li>AC = 0x01</li>";
+  html += "<li>Heater = 0x02</li>";
+  html += "<li>Lights = 0x03</li>";
 
   html += "</ul>";
 
   html +=
     "<form method='GET' action='/pzem-set'>";
 
-  html +=
-    "<label>New Address</label>";
+  html += "<label>New Address</label>";
 
-  html +=
-    "<select name='address'>";
+  html += "<select name='address'>";
 
   html +=
     "<option value='1'>0x01 - AC</option>";
@@ -3601,9 +3388,7 @@ void handlePZEMSet() {
   }
 
   int newAddress =
-    server.arg(
-      "address"
-    ).toInt();
+    server.arg("address").toInt();
 
   if (
     newAddress < 1 ||
@@ -3625,9 +3410,7 @@ void handlePZEMSet() {
     );
 
   String html =
-    htmlHeader(
-      "PZEM Result"
-    );
+    htmlHeader("PZEM Result");
 
   html += "<div class='card'>";
 
@@ -3642,8 +3425,7 @@ void handlePZEMSet() {
       "<h2 class='danger'>ADDRESS SET FAILED</h2>";
   }
 
-  html +=
-    "<p>New address: 0x";
+  html += "<p>New address: 0x";
 
   html += String(
     newAddress,
@@ -3673,9 +3455,7 @@ void handlePZEMSet() {
 void handleReset() {
 
   String html =
-    htmlHeader(
-      "Reset"
-    );
+    htmlHeader("Reset");
 
   html += "<div class='card'>";
 
@@ -3711,7 +3491,6 @@ void handleResetConfirm() {
   preferences.end();
 
   dailyEnergyKWh = 0;
-
   monthlyEnergyKWh = 0;
 
   lastTotalEnergy =
@@ -3731,12 +3510,11 @@ void handleResetConfirm() {
     i++
   ) {
 
-    historyEnergy[i] =
-      0;
-
-    historyDate[i] =
-      "";
+    historyEnergy[i] = 0;
+    historyDate[i] = "";
   }
+
+  initializeHistoryDates();
 
   saveEnergyData();
 
@@ -3761,7 +3539,7 @@ void handleNotFound() {
 }
 
 // ============================================================
-// SERVER ROUTES
+// ROUTES
 // ============================================================
 
 void setupRoutes() {
@@ -3879,9 +3657,7 @@ void setupRoutes() {
 
 void setup() {
 
-  Serial.begin(
-    115200
-  );
+  Serial.begin(115200);
 
   delay(1000);
 
@@ -3927,7 +3703,7 @@ void setup() {
   allRelaysOff();
 
   // ==========================================================
-  // LOAD SETTINGS
+  // SETTINGS
   // ==========================================================
 
   loadWiFiSettings();
@@ -3957,7 +3733,7 @@ void setup() {
   setupRoutes();
 
   // ==========================================================
-  // INITIAL READ
+  // INITIAL PZEM READ
   // ==========================================================
 
   readPZEMs();
@@ -3973,29 +3749,29 @@ void setup() {
   int month =
     getMonthNumber();
 
-  if (
-    lastDayNumber == -1
-  ) {
+  if (lastDayNumber == -1) {
 
     lastDayNumber =
       today;
   }
 
-  if (
-    lastMonth == -1
-  ) {
+  if (lastMonth == -1) {
 
     lastMonth =
       month;
   }
 
-  if (
-    lastTotalEnergy == 0
-  ) {
+  if (lastTotalEnergy == 0) {
 
     lastTotalEnergy =
       totalEnergyKWh;
   }
+
+  // ==========================================================
+  // HISTORY DATE SETUP
+  // ==========================================================
+
+  initializeHistoryDates();
 
   saveEnergyData();
 
@@ -4050,8 +3826,7 @@ void loop() {
     WiFi.status() != WL_CONNECTED
   ) {
 
-    wifiConnected =
-      false;
+    wifiConnected = false;
 
     if (
       now -
@@ -4080,12 +3855,11 @@ void loop() {
     WL_CONNECTED
   ) {
 
-    wifiConnected =
-      true;
+    wifiConnected = true;
   }
 
   // ==========================================================
-  // READ PZEM
+  // PZEM READ
   // ==========================================================
 
   if (
