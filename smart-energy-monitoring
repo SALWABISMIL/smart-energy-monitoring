@@ -1,0 +1,3581 @@
+/*
+  ============================================================
+      SMART ELECTRICITY MONITORING & ENERGY-SAVING SYSTEM
+      ESP32 + 3 x PZEM-004T V3
+  ============================================================
+
+  PZEM:
+    0x01 = AC
+    0x02 = Heater
+    0x03 = Lights
+
+  ESP32:
+    RX = GPIO16
+    TX = GPIO17
+
+  RELAYS:
+    AC      = GPIO25
+    HEATER  = GPIO26
+    LIGHTS  = GPIO27
+    SPARE   = GPIO32
+
+  Wi-Fi Setup:
+    AP: Smart-Energy-Setup
+    Password: 12345678
+    Portal: http://192.168.4.1
+
+  Normal operation:
+    http://smartenergy.local
+
+  ============================================================
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <ESPmDNS.h>
+#include <PZEM004Tv30.h>
+#include <time.h>
+#include <math.h>
+
+// ============================================================
+// BASIC CONFIGURATION
+// ============================================================
+
+#define WIFI_AP_NAME       "Smart-Energy-Setup"
+#define WIFI_AP_PASSWORD   "12345678"
+
+#define HOSTNAME           "smartenergy"
+
+#define PZEM_RX_PIN        16
+#define PZEM_TX_PIN        17
+
+#define RELAY_AC_PIN       25
+#define RELAY_HEATER_PIN   26
+#define RELAY_LIGHTS_PIN   27
+#define RELAY_SPARE_PIN    32
+
+#define RELAY_ON           LOW
+#define RELAY_OFF          HIGH
+
+#define PZEM_AC_ADDRESS      0x01
+#define PZEM_HEATER_ADDRESS  0x02
+#define PZEM_LIGHTS_ADDRESS  0x03
+#define PZEM_DEFAULT_ADDRESS 0xF8
+
+#define READ_INTERVAL_MS    5000UL
+#define SAVE_INTERVAL_MS    60000UL
+#define WIFI_RETRY_MS       15000UL
+
+#define HISTORY_DAYS        7
+
+#define DEFAULT_TARIFF      0.050f
+
+#define ENERGY_SAVE_ON_W    3000.0f
+#define ENERGY_SAVE_OFF_W   2500.0f
+
+#define HIGH_POWER_LIMIT_W  5000.0f
+
+// Oman UTC+4
+#define LOCAL_TIMEZONE_OFFSET 14400
+
+// ============================================================
+// OBJECTS
+// ============================================================
+
+WebServer server(80);
+Preferences preferences;
+
+HardwareSerial PZEMSerial(2);
+
+PZEM004Tv30 pzemAC(PZEMSerial, PZEM_AC_ADDRESS);
+PZEM004Tv30 pzemHeater(PZEMSerial, PZEM_HEATER_ADDRESS);
+PZEM004Tv30 pzemLights(PZEMSerial, PZEM_LIGHTS_ADDRESS);
+
+// ============================================================
+// WIFI VARIABLES
+// ============================================================
+
+String savedSSID = "";
+String savedPassword = "";
+
+bool wifiConnected = false;
+unsigned long lastWifiAttempt = 0;
+
+// ============================================================
+// LIVE PZEM VALUES
+// ============================================================
+
+float acVoltage = 0;
+float acCurrent = 0;
+float acPower = 0;
+float acEnergy = 0;
+
+float heaterVoltage = 0;
+float heaterCurrent = 0;
+float heaterPower = 0;
+float heaterEnergy = 0;
+
+float lightsVoltage = 0;
+float lightsCurrent = 0;
+float lightsPower = 0;
+float lightsEnergy = 0;
+
+float totalPowerW = 0;
+float totalCurrent = 0;
+
+float totalTodayEnergy = 0;
+float totalMonthEnergy = 0;
+
+float todayCost = 0;
+float monthCost = 0;
+float predictedMonthCost = 0;
+
+// ============================================================
+// ENERGY HISTORY
+// ============================================================
+
+float historyEnergy[HISTORY_DAYS] = {
+  0, 0, 0, 0, 0, 0, 0
+};
+
+String historyDate[HISTORY_DAYS] = {
+  "", "", "", "", "", "", ""
+};
+
+String currentDate = "";
+
+unsigned long lastEnergyIntegration = 0;
+unsigned long lastSave = 0;
+unsigned long lastMeterRead = 0;
+
+// ============================================================
+// SETTINGS
+// ============================================================
+
+float tariff = DEFAULT_TARIFF;
+
+float highPowerLimitW = HIGH_POWER_LIMIT_W;
+
+float energySaveOnW = ENERGY_SAVE_ON_W;
+float energySaveOffW = ENERGY_SAVE_OFF_W;
+
+// ============================================================
+// RELAY / ENERGY SAVING
+// ============================================================
+
+bool relayControlEnabled = false;
+
+bool relayACState = false;
+bool relayHeaterState = false;
+bool relayLightsState = false;
+bool relaySpareState = false;
+
+bool energySavingActive = false;
+bool heaterWasAutomaticallyOff = false;
+
+bool highConsumption = false;
+
+// Test mode
+bool energySavingTestMode = false;
+float testPowerW = 3500.0f;
+
+// Value used by automatic saving logic
+float controlPowerW = 0;
+
+// Power measured when saving started
+float savingBaselinePowerW = 0;
+
+float savedPowerW = 0;
+
+// ============================================================
+// DASHBOARD DESIGN SETTINGS
+// ============================================================
+
+String dashboardTitle = "Smart Energy Monitor";
+String siteName = "SMART ENERGY SYSTEM";
+
+String dashboardTheme = "blue";
+String dashboardAccent = "#35A7FF";
+
+String dashboardBackground = "gradient";
+String dashboardDensity = "compact";
+
+int dashboardRadius = 16;
+
+bool showAC = true;
+bool showHeater = true;
+bool showLights = true;
+
+bool showVoltage = true;
+bool showCurrent = true;
+bool showEnergy = true;
+bool showBilling = true;
+bool showHistory = true;
+bool showEnergySaving = true;
+
+int refreshSeconds = 5;
+
+String powerUnit = "kW";
+
+// ============================================================
+// HTML HELPERS
+// ============================================================
+
+String htmlEscape(String value) {
+  value.replace("&", "&amp;");
+  value.replace("<", "&lt;");
+  value.replace(">", "&gt;");
+  value.replace("\"", "&quot;");
+  value.replace("'", "&#39;");
+  return value;
+}
+
+String checked(bool value) {
+  return value ? "checked" : "";
+}
+
+String selected(String a, String b) {
+  return (a == b) ? "selected" : "";
+}
+
+String htmlHeader(String title) {
+
+  String bg;
+
+  if (dashboardBackground == "solid") {
+    bg = "background:#07111f;";
+  } else {
+    bg = "background:radial-gradient(circle at top,#123b68 0%,#081522 42%,#02060d 100%);";
+  }
+
+  String bodyDensity;
+
+  if (dashboardDensity == "normal") {
+    bodyDensity = "padding:16px;";
+  } else {
+    bodyDensity = "padding:9px;";
+  }
+
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="UTF-8">
+
+<title>)rawliteral";
+
+  html += htmlEscape(title);
+
+  html += R"rawliteral(</title>
+
+<style>
+
+:root{
+  --accent:)rawliteral";
+
+  html += dashboardAccent;
+
+  html += R"rawliteral(;
+  --radius:)rawliteral";
+
+  html += String(dashboardRadius);
+
+  html += R"rawliteral(px);
+}
+
+*{
+  box-sizing:border-box;
+}
+
+body{
+  margin:0;
+  font-family:Arial,Helvetica,sans-serif;
+  color:#edf6ff;
+  min-height:100vh;
+  )rawliteral";
+
+  html += bg;
+
+  html += R"rawliteral(
+}
+
+body.light{
+  background:#edf3f8;
+  color:#102030;
+}
+
+.container{
+  max-width:1500px;
+  margin:auto;
+  )rawliteral";
+
+  html += bodyDensity;
+
+  html += R"rawliteral(
+}
+
+.header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:12px;
+  margin-bottom:10px;
+  padding:12px 15px;
+
+  background:rgba(10,29,49,.78);
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:var(--radius);
+
+  backdrop-filter:blur(12px);
+  box-shadow:0 8px 28px rgba(0,0,0,.25);
+}
+
+.logo{
+  font-size:19px;
+  font-weight:800;
+}
+
+.subtitle{
+  font-size:11px;
+  color:#9db4c9;
+  margin-top:3px;
+}
+
+.status{
+  padding:7px 11px;
+  border-radius:30px;
+  font-size:11px;
+  font-weight:bold;
+  white-space:nowrap;
+}
+
+.online{
+  background:rgba(0,210,130,.15);
+  color:#55f0ad;
+  border:1px solid rgba(0,255,160,.25);
+}
+
+.offline{
+  background:rgba(255,80,80,.15);
+  color:#ff8585;
+  border:1px solid rgba(255,80,80,.25);
+}
+
+.grid{
+  display:grid;
+  gap:10px;
+}
+
+.top-grid{
+  grid-template-columns:2fr 1fr 1fr 1fr;
+}
+
+.load-grid{
+  grid-template-columns:repeat(3,1fr);
+  margin-top:10px;
+}
+
+.info-grid{
+  grid-template-columns:repeat(4,1fr);
+  margin-top:10px;
+}
+
+.card{
+  background:rgba(12,30,51,.74);
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:var(--radius);
+  padding:13px;
+
+  backdrop-filter:blur(12px);
+  box-shadow:0 8px 28px rgba(0,0,0,.22);
+}
+
+.card-title{
+  color:#9db4c9;
+  font-size:11px;
+  text-transform:uppercase;
+  letter-spacing:.6px;
+}
+
+.hero{
+  min-height:126px;
+  position:relative;
+  overflow:hidden;
+}
+
+.hero:after{
+  content:"";
+  position:absolute;
+  width:160px;
+  height:160px;
+  border-radius:50%;
+  right:-70px;
+  top:-80px;
+  background:var(--accent);
+  opacity:.12;
+}
+
+.big-power{
+  font-size:44px;
+  font-weight:900;
+  margin-top:10px;
+}
+
+.big-unit{
+  font-size:16px;
+  color:#a9c2d8;
+}
+
+.metric-value{
+  font-size:27px;
+  font-weight:800;
+  margin-top:7px;
+}
+
+.small-value{
+  font-size:20px;
+  font-weight:800;
+  margin-top:7px;
+}
+
+.load-power{
+  font-size:30px;
+  font-weight:900;
+  margin:6px 0;
+}
+
+.load-name{
+  font-size:16px;
+  font-weight:bold;
+}
+
+.load-head{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+}
+
+.badge{
+  font-size:10px;
+  padding:5px 8px;
+  border-radius:20px;
+  background:rgba(0,180,255,.12);
+  color:#68d7ff;
+}
+
+.stats{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:7px;
+  margin-top:9px;
+}
+
+.stat{
+  background:rgba(255,255,255,.035);
+  border-radius:9px;
+  padding:7px;
+}
+
+.stat-label{
+  font-size:9px;
+  color:#8ea6bc;
+}
+
+.stat-value{
+  font-size:12px;
+  font-weight:bold;
+  margin-top:3px;
+}
+
+.warning{
+  margin-top:10px;
+  padding:12px;
+  border-radius:var(--radius);
+  background:rgba(255,120,40,.13);
+  border:1px solid rgba(255,130,50,.28);
+  color:#ffc28d;
+}
+
+.success{
+  background:rgba(0,220,140,.10);
+  border:1px solid rgba(0,220,140,.22);
+}
+
+.energy-saving{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:10px;
+}
+
+.energy-status{
+  font-size:17px;
+  font-weight:800;
+}
+
+.nav{
+  display:flex;
+  flex-wrap:wrap;
+  gap:7px;
+  margin-top:10px;
+}
+
+.btn{
+  display:inline-block;
+  padding:9px 12px;
+  border:0;
+  border-radius:9px;
+  text-decoration:none;
+  color:white;
+  background:var(--accent);
+  font-weight:bold;
+  font-size:12px;
+  cursor:pointer;
+}
+
+.btn.secondary{
+  background:#24394f;
+}
+
+.btn.danger{
+  background:#a93636;
+}
+
+.btn.successbtn{
+  background:#16875f;
+}
+
+.section-title{
+  font-size:14px;
+  font-weight:bold;
+  margin-bottom:8px;
+}
+
+.history{
+  display:flex;
+  align-items:flex-end;
+  gap:8px;
+  height:125px;
+}
+
+.bar-wrap{
+  flex:1;
+  height:100%;
+  display:flex;
+  flex-direction:column;
+  justify-content:flex-end;
+  align-items:center;
+}
+
+.bar{
+  width:100%;
+  max-width:55px;
+  min-height:3px;
+  background:var(--accent);
+  border-radius:7px 7px 2px 2px;
+  opacity:.82;
+}
+
+.bar-label{
+  font-size:9px;
+  color:#8fa6ba;
+  margin-top:5px;
+  text-align:center;
+}
+
+.form-grid{
+  display:grid;
+  grid-template-columns:repeat(2,1fr);
+  gap:10px;
+}
+
+label{
+  display:block;
+  font-size:11px;
+  color:#9eb4c8;
+  margin-bottom:5px;
+}
+
+input,select{
+  width:100%;
+  padding:10px;
+  border-radius:9px;
+  border:1px solid rgba(255,255,255,.12);
+  background:#091827;
+  color:#eef7ff;
+  outline:none;
+}
+
+input[type="checkbox"]{
+  width:auto;
+}
+
+.checkbox{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  padding:9px;
+  background:rgba(255,255,255,.035);
+  border-radius:9px;
+}
+
+.check-grid{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:8px;
+}
+
+.range-row{
+  display:grid;
+  grid-template-columns:1fr 90px;
+  gap:8px;
+  align-items:center;
+}
+
+.footer{
+  text-align:center;
+  color:#7890a6;
+  font-size:10px;
+  padding:15px 0 5px;
+}
+
+.table{
+  width:100%;
+  border-collapse:collapse;
+  font-size:12px;
+}
+
+.table th,
+.table td{
+  padding:8px;
+  border-bottom:1px solid rgba(255,255,255,.08);
+  text-align:left;
+}
+
+@media(max-width:1050px){
+  .top-grid{
+    grid-template-columns:2fr 1fr 1fr;
+  }
+
+  .info-grid{
+    grid-template-columns:repeat(2,1fr);
+  }
+}
+
+@media(max-width:750px){
+  .top-grid,
+  .load-grid,
+  .info-grid,
+  .form-grid,
+  .check-grid{
+    grid-template-columns:1fr;
+  }
+
+  .big-power{
+    font-size:38px;
+  }
+
+  .header{
+    align-items:flex-start;
+    flex-direction:column;
+  }
+
+  .stats{
+    grid-template-columns:repeat(3,1fr);
+  }
+}
+
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+<div class="header">
+  <div>
+    <div class="logo">)rawliteral";
+
+  html += htmlEscape(dashboardTitle);
+
+  html += R"rawliteral(</div>
+    <div class="subtitle">)rawliteral";
+
+  html += htmlEscape(siteName);
+
+  html += R"rawliteral(</div>
+  </div>
+
+  <div class="status online" id="systemStatus">
+    SYSTEM ONLINE
+  </div>
+</div>
+)rawliteral";
+
+  return html;
+}
+
+String htmlFooter() {
+
+  String html = R"rawliteral(
+
+<div class="nav">
+
+<a class="btn" href="/">Dashboard</a>
+<a class="btn secondary" href="/controls">Controls</a>
+<a class="btn secondary" href="/settings">Settings</a>
+<a class="btn secondary" href="/design">Dashboard Design</a>
+<a class="btn secondary" href="/wifi">Wi-Fi</a>
+<a class="btn secondary" href="/pzem">PZEM Setup</a>
+
+</div>
+
+<div class="footer">
+Generated by SMART ENERGY SYSTEM • ESP32
+</div>
+
+</div>
+</body>
+</html>
+
+)rawliteral";
+
+  return html;
+}
+
+// ============================================================
+// FORMAT HELPERS
+// ============================================================
+
+String powerText(float watts) {
+
+  if (!isfinite(watts)) watts = 0;
+
+  if (powerUnit == "W") {
+    return String(watts, 0) + " W";
+  }
+
+  return String(watts / 1000.0f, 2) + " kW";
+}
+
+String energyText(float kWh) {
+
+  if (!isfinite(kWh)) kWh = 0;
+
+  return String(kWh, 2) + " kWh";
+}
+
+String moneyText(float value) {
+
+  if (!isfinite(value)) value = 0;
+
+  return String(value, 3);
+}
+
+String relayText(bool state) {
+  return state ? "ON" : "OFF";
+}
+
+// ============================================================
+// PREFERENCES - WIFI
+// ============================================================
+
+void loadWiFiSettings() {
+
+  preferences.begin("wifi", true);
+
+  savedSSID = preferences.getString("ssid", "");
+  savedPassword = preferences.getString("pass", "");
+
+  preferences.end();
+}
+
+void saveWiFiSettings(String ssid, String password) {
+
+  preferences.begin("wifi", false);
+
+  preferences.putString("ssid", ssid);
+  preferences.putString("pass", password);
+
+  preferences.end();
+}
+
+// ============================================================
+// PREFERENCES - SYSTEM SETTINGS
+// ============================================================
+
+void loadSystemSettings() {
+
+  preferences.begin("system", true);
+
+  tariff = preferences.getFloat("tariff", DEFAULT_TARIFF);
+
+  highPowerLimitW =
+    preferences.getFloat("highLimit", HIGH_POWER_LIMIT_W);
+
+  energySaveOnW =
+    preferences.getFloat("saveOn", ENERGY_SAVE_ON_W);
+
+  energySaveOffW =
+    preferences.getFloat("saveOff", ENERGY_SAVE_OFF_W);
+
+  relayControlEnabled =
+    preferences.getBool("relayEnable", false);
+
+  preferences.end();
+}
+
+void saveSystemSettings() {
+
+  preferences.begin("system", false);
+
+  preferences.putFloat("tariff", tariff);
+  preferences.putFloat("highLimit", highPowerLimitW);
+  preferences.putFloat("saveOn", energySaveOnW);
+  preferences.putFloat("saveOff", energySaveOffW);
+  preferences.putBool("relayEnable", relayControlEnabled);
+
+  preferences.end();
+}
+
+// ============================================================
+// PREFERENCES - DASHBOARD DESIGN
+// ============================================================
+
+void loadDashboardSettings() {
+
+  preferences.begin("design", true);
+
+  dashboardTitle =
+    preferences.getString("title", "Smart Energy Monitor");
+
+  siteName =
+    preferences.getString("site", "SMART ENERGY SYSTEM");
+
+  dashboardTheme =
+    preferences.getString("theme", "blue");
+
+  dashboardAccent =
+    preferences.getString("accent", "#35A7FF");
+
+  dashboardBackground =
+    preferences.getString("background", "gradient");
+
+  dashboardDensity =
+    preferences.getString("density", "compact");
+
+  dashboardRadius =
+    preferences.getInt("radius", 16);
+
+  showAC =
+    preferences.getBool("showAC", true);
+
+  showHeater =
+    preferences.getBool("showHeater", true);
+
+  showLights =
+    preferences.getBool("showLights", true);
+
+  showVoltage =
+    preferences.getBool("showVoltage", true);
+
+  showCurrent =
+    preferences.getBool("showCurrent", true);
+
+  showEnergy =
+    preferences.getBool("showEnergy", true);
+
+  showBilling =
+    preferences.getBool("showBilling", true);
+
+  showHistory =
+    preferences.getBool("showHistory", true);
+
+  showEnergySaving =
+    preferences.getBool("showSave", true);
+
+  refreshSeconds =
+    preferences.getInt("refresh", 5);
+
+  powerUnit =
+    preferences.getString("unit", "kW");
+
+  preferences.end();
+}
+
+void saveDashboardSettings() {
+
+  preferences.begin("design", false);
+
+  preferences.putString("title", dashboardTitle);
+  preferences.putString("site", siteName);
+
+  preferences.putString("theme", dashboardTheme);
+  preferences.putString("accent", dashboardAccent);
+  preferences.putString("background", dashboardBackground);
+  preferences.putString("density", dashboardDensity);
+
+  preferences.putInt("radius", dashboardRadius);
+
+  preferences.putBool("showAC", showAC);
+  preferences.putBool("showHeater", showHeater);
+  preferences.putBool("showLights", showLights);
+
+  preferences.putBool("showVoltage", showVoltage);
+  preferences.putBool("showCurrent", showCurrent);
+  preferences.putBool("showEnergy", showEnergy);
+  preferences.putBool("showBilling", showBilling);
+  preferences.putBool("showHistory", showHistory);
+  preferences.putBool("showSave", showEnergySaving);
+
+  preferences.putInt("refresh", refreshSeconds);
+
+  preferences.putString("unit", powerUnit);
+
+  preferences.end();
+}
+
+// ============================================================
+// PREFERENCES - ENERGY DATA
+// ============================================================
+
+void loadEnergyData() {
+
+  preferences.begin("energy", true);
+
+  totalTodayEnergy =
+    preferences.getFloat("today", 0);
+
+  totalMonthEnergy =
+    preferences.getFloat("month", 0);
+
+  currentDate =
+    preferences.getString("date", "");
+
+  for (int i = 0; i < HISTORY_DAYS; i++) {
+
+    String keyE = "e" + String(i);
+    String keyD = "d" + String(i);
+
+    historyEnergy[i] =
+      preferences.getFloat(keyE.c_str(), 0);
+
+    historyDate[i] =
+      preferences.getString(keyD.c_str(), "");
+  }
+
+  preferences.end();
+}
+
+void saveEnergyData() {
+
+  preferences.begin("energy", false);
+
+  preferences.putFloat("today", totalTodayEnergy);
+  preferences.putFloat("month", totalMonthEnergy);
+  preferences.putString("date", currentDate);
+
+  for (int i = 0; i < HISTORY_DAYS; i++) {
+
+    String keyE = "e" + String(i);
+    String keyD = "d" + String(i);
+
+    preferences.putFloat(keyE.c_str(), historyEnergy[i]);
+    preferences.putString(keyD.c_str(), historyDate[i]);
+  }
+
+  preferences.end();
+}
+
+// ============================================================
+// TIME
+// ============================================================
+
+String getDateString() {
+
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo, 1000)) {
+    return "";
+  }
+
+  char buffer[16];
+
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d", &timeinfo);
+
+  return String(buffer);
+}
+
+int getCurrentDayOfMonth() {
+
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo, 1000)) {
+    return 1;
+  }
+
+  return timeinfo.tm_mday;
+}
+
+int getDaysInCurrentMonth() {
+
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo, 1000)) {
+    return 30;
+  }
+
+  int month = timeinfo.tm_mon + 1;
+  int year = timeinfo.tm_year + 1900;
+
+  if (month == 2) {
+
+    bool leap =
+      ((year % 4 == 0 && year % 100 != 0) ||
+       (year % 400 == 0));
+
+    return leap ? 29 : 28;
+  }
+
+  if (month == 4 ||
+      month == 6 ||
+      month == 9 ||
+      month == 11) {
+
+    return 30;
+  }
+
+  return 31;
+}
+
+// ============================================================
+// DAILY / MONTHLY DATE MANAGEMENT
+// ============================================================
+
+void checkDateChange() {
+
+  String newDate = getDateString();
+
+  if (newDate == "") {
+    return;
+  }
+
+  if (currentDate == "") {
+
+    currentDate = newDate;
+    saveEnergyData();
+
+    return;
+  }
+
+  if (newDate != currentDate) {
+
+    // Shift history
+    for (int i = HISTORY_DAYS - 1; i > 0; i--) {
+
+      historyEnergy[i] = historyEnergy[i - 1];
+      historyDate[i] = historyDate[i - 1];
+    }
+
+    historyEnergy[0] = totalTodayEnergy;
+    historyDate[0] = currentDate;
+
+    totalTodayEnergy = 0;
+
+    currentDate = newDate;
+
+    saveEnergyData();
+
+    Serial.println("New day detected.");
+  }
+}
+
+// ============================================================
+// PZEM READ
+// ============================================================
+
+float safeVoltage(PZEM004Tv30 &meter) {
+
+  float value = meter.voltage();
+
+  if (!isfinite(value)) return 0;
+
+  return value;
+}
+
+float safeCurrent(PZEM004Tv30 &meter) {
+
+  float value = meter.current();
+
+  if (!isfinite(value)) return 0;
+
+  return value;
+}
+
+float safePower(PZEM004Tv30 &meter) {
+
+  float value = meter.power();
+
+  if (!isfinite(value)) return 0;
+
+  return value;
+}
+
+float safeEnergy(PZEM004Tv30 &meter) {
+
+  float value = meter.energy();
+
+  if (!isfinite(value)) return 0;
+
+  return value;
+}
+
+void readAllMeters() {
+
+  acVoltage = safeVoltage(pzemAC);
+  acCurrent = safeCurrent(pzemAC);
+  acPower = safePower(pzemAC);
+  acEnergy = safeEnergy(pzemAC);
+
+  heaterVoltage = safeVoltage(pzemHeater);
+  heaterCurrent = safeCurrent(pzemHeater);
+  heaterPower = safePower(pzemHeater);
+  heaterEnergy = safeEnergy(pzemHeater);
+
+  lightsVoltage = safeVoltage(pzemLights);
+  lightsCurrent = safeCurrent(pzemLights);
+  lightsPower = safePower(pzemLights);
+  lightsEnergy = safeEnergy(pzemLights);
+
+  totalPowerW =
+    acPower +
+    heaterPower +
+    lightsPower;
+
+  totalCurrent =
+    acCurrent +
+    heaterCurrent +
+    lightsCurrent;
+
+  highConsumption =
+    totalPowerW >= highPowerLimitW;
+
+  Serial.println("-----------------------------");
+
+  Serial.print("AC Power: ");
+  Serial.print(acPower, 2);
+  Serial.println(" W");
+
+  Serial.print("Heater Power: ");
+  Serial.print(heaterPower, 2);
+  Serial.println(" W");
+
+  Serial.print("Lights Power: ");
+  Serial.print(lightsPower, 2);
+  Serial.println(" W");
+
+  Serial.print("TOTAL: ");
+  Serial.print(totalPowerW, 2);
+  Serial.println(" W");
+}
+
+// ============================================================
+// ENERGY INTEGRATION
+// ============================================================
+
+void integrateEnergy() {
+
+  unsigned long now = millis();
+
+  if (lastEnergyIntegration == 0) {
+
+    lastEnergyIntegration = now;
+    return;
+  }
+
+  unsigned long elapsedMs =
+    now - lastEnergyIntegration;
+
+  lastEnergyIntegration = now;
+
+  if (elapsedMs > 60000UL) {
+    return;
+  }
+
+  float hours =
+    elapsedMs / 3600000.0f;
+
+  float addedKWh =
+    (totalPowerW / 1000.0f) * hours;
+
+  if (addedKWh < 0) {
+    addedKWh = 0;
+  }
+
+  totalTodayEnergy += addedKWh;
+  totalMonthEnergy += addedKWh;
+}
+
+// ============================================================
+// BILLING
+// ============================================================
+
+void calculateBilling() {
+
+  todayCost =
+    totalTodayEnergy * tariff;
+
+  monthCost =
+    totalMonthEnergy * tariff;
+
+  int day =
+    getCurrentDayOfMonth();
+
+  int days =
+    getDaysInCurrentMonth();
+
+  if (day > 0 && totalMonthEnergy > 0) {
+
+    float dailyAverage =
+      totalMonthEnergy / day;
+
+    float predictedEnergy =
+      dailyAverage * days;
+
+    predictedMonthCost =
+      predictedEnergy * tariff;
+
+  } else {
+
+    predictedMonthCost = 0;
+  }
+}
+
+// ============================================================
+// HISTORY TOTAL
+// ============================================================
+
+float sevenDayEnergy() {
+
+  float total = totalTodayEnergy;
+
+  for (int i = 0; i < HISTORY_DAYS; i++) {
+    total += historyEnergy[i];
+  }
+
+  return total;
+}
+
+// ============================================================
+// RELAY CONTROL
+// ============================================================
+
+void writeRelay(int pin, bool state) {
+
+  digitalWrite(
+    pin,
+    state ? RELAY_ON : RELAY_OFF
+  );
+}
+
+void allRelaysOff() {
+
+  relayACState = false;
+  relayHeaterState = false;
+  relayLightsState = false;
+  relaySpareState = false;
+
+  writeRelay(RELAY_AC_PIN, false);
+  writeRelay(RELAY_HEATER_PIN, false);
+  writeRelay(RELAY_LIGHTS_PIN, false);
+  writeRelay(RELAY_SPARE_PIN, false);
+}
+
+void setRelay(int pin, bool state) {
+
+  if (!relayControlEnabled) {
+    return;
+  }
+
+  writeRelay(pin, state);
+
+  if (pin == RELAY_AC_PIN)
+    relayACState = state;
+
+  if (pin == RELAY_HEATER_PIN)
+    relayHeaterState = state;
+
+  if (pin == RELAY_LIGHTS_PIN)
+    relayLightsState = state;
+
+  if (pin == RELAY_SPARE_PIN)
+    relaySpareState = state;
+}
+
+// ============================================================
+// AUTO ENERGY SAVING
+// ============================================================
+
+void energySavingLogic() {
+
+  if (!relayControlEnabled) {
+
+    energySavingActive = false;
+    savedPowerW = 0;
+    savingBaselinePowerW = 0;
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // HIGH POWER
+  // ----------------------------------------------------------
+
+  if (controlPowerW >= energySaveOnW &&
+      !energySavingActive) {
+
+    energySavingActive = true;
+
+    savingBaselinePowerW =
+      controlPowerW;
+
+    setRelay(
+      RELAY_HEATER_PIN,
+      false
+    );
+
+    heaterWasAutomaticallyOff = true;
+
+    Serial.println(
+      "ENERGY SAVING: Heater OFF"
+    );
+  }
+
+  // ----------------------------------------------------------
+  // RETURN TO NORMAL
+  // ----------------------------------------------------------
+
+  else if (controlPowerW <= energySaveOffW &&
+           energySavingActive) {
+
+    energySavingActive = false;
+
+    savedPowerW = 0;
+
+    savingBaselinePowerW = 0;
+
+    heaterWasAutomaticallyOff = false;
+
+    /*
+      Important:
+      Heater is NOT automatically turned ON.
+
+      This is intentional for safety.
+      User can manually turn it ON again.
+    */
+
+    Serial.println(
+      "ENERGY SAVING: Normal"
+    );
+  }
+
+  // ----------------------------------------------------------
+  // ESTIMATE REAL SAVING
+  // ----------------------------------------------------------
+
+  if (energySavingActive &&
+      !energySavingTestMode &&
+      savingBaselinePowerW > 0) {
+
+    savedPowerW =
+      max(
+        0.0f,
+        savingBaselinePowerW - totalPowerW
+      );
+
+  } else {
+
+    savedPowerW = 0;
+  }
+}
+
+// ============================================================
+// DASHBOARD METER CARD
+// ============================================================
+
+String meterCard(
+  String name,
+  float power,
+  float voltage,
+  float current,
+  float energy,
+  bool visible
+) {
+
+  if (!visible) {
+    return "";
+  }
+
+  String html;
+
+  html += "<div class='card'>";
+
+  html += "<div class='load-head'>";
+  html += "<div class='load-name'>";
+  html += name;
+  html += "</div>";
+
+  html += "<div class='badge'>LIVE</div>";
+
+  html += "</div>";
+
+  html += "<div class='load-power'>";
+  html += powerText(power);
+  html += "</div>";
+
+  html += "<div class='stats'>";
+
+  if (showVoltage) {
+
+    html += "<div class='stat'>";
+    html += "<div class='stat-label'>VOLTAGE</div>";
+    html += "<div class='stat-value'>";
+    html += String(voltage, 1);
+    html += " V</div>";
+    html += "</div>";
+  }
+
+  if (showCurrent) {
+
+    html += "<div class='stat'>";
+    html += "<div class='stat-label'>CURRENT</div>";
+    html += "<div class='stat-value'>";
+    html += String(current, 2);
+    html += " A</div>";
+    html += "</div>";
+  }
+
+  if (showEnergy) {
+
+    html += "<div class='stat'>";
+    html += "<div class='stat-label'>METER</div>";
+    html += "<div class='stat-value'>";
+    html += String(energy, 2);
+    html += " kWh</div>";
+    html += "</div>";
+  }
+
+  html += "</div>";
+
+  html += "</div>";
+
+  return html;
+}
+
+// ============================================================
+// DASHBOARD
+// ============================================================
+
+void handleRoot() {
+
+  calculateBilling();
+
+  String html =
+    htmlHeader("Dashboard");
+
+  // ----------------------------------------------------------
+  // TOP GRID
+  // ----------------------------------------------------------
+
+  html += "<div class='grid top-grid'>";
+
+  html += "<div class='card hero'>";
+  html += "<div class='card-title'>TOTAL POWER</div>";
+  html += "<div class='big-power'>";
+  html += powerText(totalPowerW);
+  html += "</div>";
+  html += "<div class='big-unit'>Live electrical load</div>";
+  html += "</div>";
+
+  html += "<div class='card'>";
+  html += "<div class='card-title'>VOLTAGE</div>";
+  html += "<div class='metric-value'>";
+  html += String(
+    max(
+      max(acVoltage, heaterVoltage),
+      lightsVoltage
+    ),
+    1
+  );
+  html += " V</div>";
+  html += "</div>";
+
+  html += "<div class='card'>";
+  html += "<div class='card-title'>CURRENT</div>";
+  html += "<div class='metric-value'>";
+  html += String(totalCurrent, 2);
+  html += " A</div>";
+  html += "</div>";
+
+  html += "<div class='card'>";
+  html += "<div class='card-title'>TODAY</div>";
+  html += "<div class='metric-value'>";
+  html += String(totalTodayEnergy, 2);
+  html += " kWh</div>";
+  html += "</div>";
+
+  html += "</div>";
+
+  // ----------------------------------------------------------
+  // LOAD CARDS
+  // ----------------------------------------------------------
+
+  html += "<div class='grid load-grid'>";
+
+  html += meterCard(
+    "AC",
+    acPower,
+    acVoltage,
+    acCurrent,
+    acEnergy,
+    showAC
+  );
+
+  html += meterCard(
+    "HEATER",
+    heaterPower,
+    heaterVoltage,
+    heaterCurrent,
+    heaterEnergy,
+    showHeater
+  );
+
+  html += meterCard(
+    "LIGHTS",
+    lightsPower,
+    lightsVoltage,
+    lightsCurrent,
+    lightsEnergy,
+    showLights
+  );
+
+  html += "</div>";
+
+  // ----------------------------------------------------------
+  // BILLING / ENERGY INFO
+  // ----------------------------------------------------------
+
+  if (showBilling) {
+
+    html += "<div class='grid info-grid'>";
+
+    html += "<div class='card'>";
+    html += "<div class='card-title'>TODAY BILL</div>";
+    html += "<div class='small-value'>";
+    html += moneyText(todayCost);
+    html += "</div>";
+    html += "<div class='subtitle'>Tariff ";
+    html += String(tariff, 3);
+    html += " / kWh</div>";
+    html += "</div>";
+
+    html += "<div class='card'>";
+    html += "<div class='card-title'>MONTH ENERGY</div>";
+    html += "<div class='small-value'>";
+    html += String(totalMonthEnergy, 2);
+    html += " kWh</div>";
+    html += "</div>";
+
+    html += "<div class='card'>";
+    html += "<div class='card-title'>MONTH BILL</div>";
+    html += "<div class='small-value'>";
+    html += moneyText(monthCost);
+    html += "</div>";
+    html += "</div>";
+
+    html += "<div class='card'>";
+    html += "<div class='card-title'>PREDICTED BILL</div>";
+    html += "<div class='small-value'>";
+    html += moneyText(predictedMonthCost);
+    html += "</div>";
+    html += "</div>";
+
+    html += "</div>";
+  }
+
+  // ----------------------------------------------------------
+  // HIGH CONSUMPTION
+  // ----------------------------------------------------------
+
+  if (highConsumption) {
+
+    html += "<div class='warning'>";
+    html += "<b>HIGH CONSUMPTION</b><br>";
+    html += "Current load is above ";
+    html += powerText(highPowerLimitW);
+    html += ".";
+    html += "</div>";
+  }
+
+  // ----------------------------------------------------------
+  // ENERGY SAVING
+  // ----------------------------------------------------------
+
+  if (showEnergySaving) {
+
+    html += "<div class='card' style='margin-top:10px'>";
+
+    html += "<div class='energy-saving'>";
+
+    html += "<div>";
+
+    html += "<div class='card-title'>";
+    html += "AUTOMATIC ENERGY SAVING";
+    html += "</div>";
+
+    html += "<div class='energy-status'>";
+
+    if (!relayControlEnabled) {
+
+      html += "DISABLED";
+
+    } else if (energySavingTestMode) {
+
+      html += "TEST MODE";
+
+    } else if (energySavingActive) {
+
+      html += "ACTIVE";
+
+    } else {
+
+      html += "NORMAL";
+    }
+
+    html += "</div>";
+
+    html += "<div class='subtitle'>";
+
+    if (energySavingTestMode) {
+
+      html += "Simulation power: ";
+      html += powerText(testPowerW);
+
+    } else {
+
+      html += "Trigger ON: ";
+      html += powerText(energySaveOnW);
+      html += " • OFF: ";
+      html += powerText(energySaveOffW);
+    }
+
+    html += "</div>";
+
+    html += "</div>";
+
+    html += "<div>";
+
+    if (heaterWasAutomaticallyOff) {
+
+      html += "<span class='badge'>";
+      html += "HEATER AUTOMATICALLY OFF";
+      html += "</span>";
+
+    } else {
+
+      html += "<span class='badge'>";
+      html += "HEATER NORMAL";
+      html += "</span>";
+    }
+
+    html += "</div>";
+
+    html += "</div>";
+
+    html += "</div>";
+  }
+
+  // ----------------------------------------------------------
+  // HISTORY
+  // ----------------------------------------------------------
+
+  if (showHistory) {
+
+    html += "<div class='card' style='margin-top:10px'>";
+
+    html += "<div class='section-title'>";
+    html += "7-DAY ENERGY HISTORY";
+    html += "</div>";
+
+    html += "<div class='history'>";
+
+    float maxHistory = totalTodayEnergy;
+
+    for (int i = 0; i < HISTORY_DAYS; i++) {
+
+      if (historyEnergy[i] > maxHistory) {
+        maxHistory = historyEnergy[i];
+      }
+    }
+
+    if (maxHistory < 0.01f) {
+      maxHistory = 1;
+    }
+
+    // Today
+    {
+
+      float height =
+        (totalTodayEnergy / maxHistory) * 100.0f;
+
+      if (height < 3) height = 3;
+
+      html += "<div class='bar-wrap'>";
+
+      html += "<div class='bar' style='height:";
+      html += String(height, 0);
+      html += "%'></div>";
+
+      html += "<div class='bar-label'>";
+      html += "Today";
+      html += "</div>";
+
+      html += "</div>";
+    }
+
+    for (int i = 0; i < HISTORY_DAYS; i++) {
+
+      float height =
+        (historyEnergy[i] / maxHistory) * 100.0f;
+
+      if (height < 3) height = 3;
+
+      html += "<div class='bar-wrap'>";
+
+      html += "<div class='bar' style='height:";
+      html += String(height, 0);
+      html += "%'></div>";
+
+      html += "<div class='bar-label'>";
+
+      if (historyDate[i] == "") {
+        html += "-";
+      } else {
+        html += historyDate[i].substring(5);
+      }
+
+      html += "</div>";
+
+      html += "</div>";
+    }
+
+    html += "</div>";
+
+    html += "<div class='subtitle'>";
+    html += "7-day total: ";
+    html += String(sevenDayEnergy(), 2);
+    html += " kWh";
+    html += "</div>";
+
+    html += "</div>";
+  }
+
+  // ----------------------------------------------------------
+  // JAVASCRIPT AUTO REFRESH
+  // ----------------------------------------------------------
+
+  html += "<script>";
+
+  html += "setTimeout(function(){location.reload();},";
+  html += String(max(2, refreshSeconds));
+  html += "000);";
+
+  html += "</script>";
+
+  html += htmlFooter();
+
+  server.send(200, "text/html", html);
+}
+
+// ============================================================
+// API
+// ============================================================
+
+void handleAPI() {
+
+  calculateBilling();
+
+  String json = "{";
+
+  json += "\"acPower\":";
+  json += String(acPower, 2);
+
+  json += ",\"heaterPower\":";
+  json += String(heaterPower, 2);
+
+  json += ",\"lightsPower\":";
+  json += String(lightsPower, 2);
+
+  json += ",\"totalPower\":";
+  json += String(totalPowerW, 2);
+
+  json += ",\"todayEnergy\":";
+  json += String(totalTodayEnergy, 2);
+
+  json += ",\"monthEnergy\":";
+  json += String(totalMonthEnergy, 2);
+
+  json += ",\"todayCost\":";
+  json += String(todayCost, 3);
+
+  json += ",\"monthCost\":";
+  json += String(monthCost, 3);
+
+  json += ",\"predictedCost\":";
+  json += String(predictedMonthCost, 3);
+
+  json += ",\"relayControl\":";
+  json += relayControlEnabled ? "true" : "false";
+
+  json += ",\"energySaving\":";
+  json += energySavingActive ? "true" : "false";
+
+  json += ",\"testMode\":";
+  json += energySavingTestMode ? "true" : "false";
+
+  json += ",\"highConsumption\":";
+  json += highConsumption ? "true" : "false";
+
+  json += ",\"savedPower\":";
+  json += String(savedPowerW, 2);
+
+  json += "}";
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
+
+// ============================================================
+// CONTROLS PAGE
+// ============================================================
+
+void handleControls() {
+
+  String html =
+    htmlHeader("Controls");
+
+  html += "<div class='card'>";
+
+  html += "<div class='section-title'>";
+  html += "RELAY CONTROL";
+  html += "</div>";
+
+  html += "<p>";
+
+  if (relayControlEnabled) {
+
+    html += "Relay control is <b>ENABLED</b>.";
+
+  } else {
+
+    html += "Relay control is <b>DISABLED</b>.";
+  }
+
+  html += "</p>";
+
+  if (!relayControlEnabled) {
+
+    html += "<a class='btn successbtn' href='/relay-enable?state=1'>";
+    html += "ENABLE RELAY CONTROL";
+    html += "</a>";
+
+  } else {
+
+    html += "<a class='btn danger' href='/relay-enable?state=0'>";
+    html += "DISABLE RELAY CONTROL";
+    html += "</a>";
+  }
+
+  html += "</div>";
+
+  // ----------------------------------------------------------
+  // RELAYS
+  // ----------------------------------------------------------
+
+  html += "<div class='card' style='margin-top:10px'>";
+
+  html += "<div class='section-title'>";
+  html += "MANUAL RELAYS";
+  html += "</div>";
+
+  if (!relayControlEnabled) {
+
+    html += "<p class='subtitle'>";
+    html += "Enable relay control first.";
+    html += "</p>";
+  }
+
+  html += "<p>AC: <b>";
+  html += relayText(relayACState);
+  html += "</b></p>";
+
+  html += "<a class='btn' href='/relay?name=ac&state=1'>AC ON</a> ";
+  html += "<a class='btn danger' href='/relay?name=ac&state=0'>AC OFF</a>";
+
+  html += "<p>HEATER: <b>";
+  html += relayText(relayHeaterState);
+  html += "</b></p>";
+
+  html += "<a class='btn' href='/relay?name=heater&state=1'>HEATER ON</a> ";
+  html += "<a class='btn danger' href='/relay?name=heater&state=0'>HEATER OFF</a>";
+
+  html += "<p>LIGHTS: <b>";
+  html += relayText(relayLightsState);
+  html += "</b></p>";
+
+  html += "<a class='btn' href='/relay?name=lights&state=1'>LIGHTS ON</a> ";
+  html += "<a class='btn danger' href='/relay?name=lights&state=0'>LIGHTS OFF</a>";
+
+  html += "<p>SPARE: <b>";
+  html += relayText(relaySpareState);
+  html += "</b></p>";
+
+  html += "<a class='btn' href='/relay?name=spare&state=1'>SPARE ON</a> ";
+  html += "<a class='btn danger' href='/relay?name=spare&state=0'>SPARE OFF</a>";
+
+  html += "</div>";
+
+  // ----------------------------------------------------------
+  // AUTO SAVING
+  // ----------------------------------------------------------
+
+  html += "<div class='card' style='margin-top:10px'>";
+
+  html += "<div class='section-title'>";
+  html += "AUTOMATIC ENERGY SAVING";
+  html += "</div>";
+
+  html += "<p>";
+
+  html += "Current control power: <b>";
+  html += powerText(
+    energySavingTestMode
+      ? testPowerW
+      : totalPowerW
+  );
+  html += "</b>";
+
+  html += "</p>";
+
+  html += "<p>";
+
+  html += "ON trigger: <b>";
+  html += powerText(energySaveOnW);
+  html += "</b><br>";
+
+  html += "OFF trigger: <b>";
+  html += powerText(energySaveOffW);
+  html += "</b>";
+
+  html += "</p>";
+
+  if (energySavingActive) {
+
+    html += "<div class='warning success'>";
+    html += "<b>ENERGY SAVING ACTIVE</b><br>";
+    html += "Heater relay has been automatically turned OFF.";
+    html += "</div>";
+
+  } else {
+
+    html += "<div class='card'>";
+    html += "Energy saving status: <b>NORMAL</b>";
+    html += "</div>";
+  }
+
+  html += "<h4>TEST MODE</h4>";
+
+  html += "<p class='subtitle'>";
+  html += "Test the automatic-saving system before PZEM meters arrive.";
+  html += "</p>";
+
+  html += "<a class='btn' href='/autosave-test?state=1'>";
+  html += "TEST HIGH 3.5 kW";
+  html += "</a> ";
+
+  html += "<a class='btn successbtn' href='/autosave-test?state=2'>";
+  html += "TEST NORMAL 2.0 kW";
+  html += "</a> ";
+
+  html += "<a class='btn secondary' href='/autosave-test?state=0'>";
+  html += "STOP TEST";
+  html += "</a>";
+
+  html += "</div>";
+
+  html += htmlFooter();
+
+  server.send(200, "text/html", html);
+}
+
+// ============================================================
+// RELAY ENABLE
+// ============================================================
+
+void handleRelayEnable() {
+
+  int state =
+    server.arg("state").toInt();
+
+  if (state == 1) {
+
+    relayControlEnabled = true;
+
+  } else {
+
+    relayControlEnabled = false;
+
+    energySavingTestMode = false;
+    energySavingActive = false;
+
+    savingBaselinePowerW = 0;
+    savedPowerW = 0;
+
+    allRelaysOff();
+  }
+
+  saveSystemSettings();
+
+  server.sendHeader(
+    "Location",
+    "/controls"
+  );
+
+  server.send(
+    303,
+    "text/plain",
+    ""
+  );
+}
+
+// ============================================================
+// MANUAL RELAY
+// ============================================================
+
+void handleRelay() {
+
+  if (!relayControlEnabled) {
+
+    server.send(
+      403,
+      "text/plain",
+      "Relay control is disabled."
+    );
+
+    return;
+  }
+
+  String name =
+    server.arg("name");
+
+  int state =
+    server.arg("state").toInt();
+
+  bool value =
+    state == 1;
+
+  if (name == "ac") {
+
+    setRelay(
+      RELAY_AC_PIN,
+      value
+    );
+
+  } else if (name == "heater") {
+
+    setRelay(
+      RELAY_HEATER_PIN,
+      value
+    );
+
+    if (value) {
+      heaterWasAutomaticallyOff = false;
+    }
+
+  } else if (name == "lights") {
+
+    setRelay(
+      RELAY_LIGHTS_PIN,
+      value
+    );
+
+  } else if (name == "spare") {
+
+    setRelay(
+      RELAY_SPARE_PIN,
+      value
+    );
+  }
+
+  server.sendHeader(
+    "Location",
+    "/controls"
+  );
+
+  server.send(
+    303,
+    "text/plain",
+    ""
+  );
+}
+
+// ============================================================
+// AUTO SAVE TEST
+// ============================================================
+
+void handleAutoSaveTest() {
+
+  int state =
+    server.arg("state").toInt();
+
+  if (state != 0 &&
+      !relayControlEnabled) {
+
+    server.send(
+      403,
+      "text/plain",
+      "Enable Relay Control first."
+    );
+
+    return;
+  }
+
+  if (state == 1) {
+
+    testPowerW = 3500.0f;
+
+    energySavingTestMode = true;
+
+    Serial.println(
+      "AUTO SAVE TEST: HIGH 3.5kW"
+    );
+
+  } else if (state == 2) {
+
+    testPowerW = 2000.0f;
+
+    energySavingTestMode = true;
+
+    Serial.println(
+      "AUTO SAVE TEST: NORMAL 2.0kW"
+    );
+
+  } else {
+
+    energySavingTestMode = false;
+
+    energySavingActive = false;
+
+    savingBaselinePowerW = 0;
+
+    savedPowerW = 0;
+
+    heaterWasAutomaticallyOff = false;
+
+    Serial.println(
+      "AUTO SAVE TEST STOPPED"
+    );
+  }
+
+  server.sendHeader(
+    "Location",
+    "/controls"
+  );
+
+  server.send(
+    303,
+    "text/plain",
+    ""
+  );
+}
+
+// ============================================================
+// SETTINGS PAGE
+// ============================================================
+
+void handleSettings() {
+
+  String html =
+    htmlHeader("Settings");
+
+  html += "<div class='card'>";
+
+  html += "<div class='section-title'>";
+  html += "ENERGY & BILLING SETTINGS";
+  html += "</div>";
+
+  html += "<form method='POST' action='/settings-save'>";
+
+  html += "<div class='form-grid'>";
+
+  html += "<div>";
+  html += "<label>Tariff per kWh</label>";
+  html += "<input name='tariff' type='number' step='0.001' value='";
+  html += String(tariff, 3);
+  html += "'>";
+  html += "</div>";
+
+  html += "<div>";
+  html += "<label>High Consumption Limit (W)</label>";
+  html += "<input name='highLimit' type='number' step='100' value='";
+  html += String(highPowerLimitW, 0);
+  html += "'>";
+  html += "</div>";
+
+  html += "<div>";
+  html += "<label>Energy Saving ON (W)</label>";
+  html += "<input name='saveOn' type='number' step='100' value='";
+  html += String(energySaveOnW, 0);
+  html += "'>";
+  html += "</div>";
+
+  html += "<div>";
+  html += "<label>Energy Saving OFF (W)</label>";
+  html += "<input name='saveOff' type='number' step='100' value='";
+  html += String(energySaveOffW, 0);
+  html += "'>";
+  html += "</div>";
+
+  html += "</div>";
+
+  html += "<br>";
+  html += "<button class='btn' type='submit'>";
+  html += "SAVE SETTINGS";
+  html += "</button>";
+
+  html += "</form>";
+
+  html += "</div>";
+
+  // ----------------------------------------------------------
+  // CURRENT VALUES
+  // ----------------------------------------------------------
+
+  html += "<div class='card' style='margin-top:10px'>";
+
+  html += "<div class='section-title'>";
+  html += "CURRENT VALUES";
+  html += "</div>";
+
+  html += "<table class='table'>";
+
+  html += "<tr><th>Parameter</th><th>Value</th></tr>";
+
+  html += "<tr><td>Tariff</td><td>";
+  html += String(tariff, 3);
+  html += "</td></tr>";
+
+  html += "<tr><td>High Consumption</td><td>";
+  html += powerText(highPowerLimitW);
+  html += "</td></tr>";
+
+  html += "<tr><td>Energy Saving ON</td><td>";
+  html += powerText(energySaveOnW);
+  html += "</td></tr>";
+
+  html += "<tr><td>Energy Saving OFF</td><td>";
+  html += powerText(energySaveOffW);
+  html += "</td></tr>";
+
+  html += "</table>";
+
+  html += "</div>";
+
+  html += htmlFooter();
+
+  server.send(200, "text/html", html);
+}
+
+// ============================================================
+// SAVE SETTINGS
+// ============================================================
+
+void handleSettingsSave() {
+
+  if (server.hasArg("tariff")) {
+
+    tariff =
+      server.arg("tariff").toFloat();
+  }
+
+  if (server.hasArg("highLimit")) {
+
+    highPowerLimitW =
+      server.arg("highLimit").toFloat();
+  }
+
+  if (server.hasArg("saveOn")) {
+
+    energySaveOnW =
+      server.arg("saveOn").toFloat();
+  }
+
+  if (server.hasArg("saveOff")) {
+
+    energySaveOffW =
+      server.arg("saveOff").toFloat();
+  }
+
+  if (tariff < 0)
+    tariff = 0;
+
+  if (highPowerLimitW < 100)
+    highPowerLimitW = 100;
+
+  if (energySaveOnW < 100)
+    energySaveOnW = 100;
+
+  if (energySaveOffW < 0)
+    energySaveOffW = 0;
+
+  saveSystemSettings();
+
+  server.sendHeader(
+    "Location",
+    "/settings"
+  );
+
+  server.send(
+    303,
+    "text/plain",
+    ""
+  );
+}
+
+// ============================================================
+// DASHBOARD DESIGN PAGE
+// ============================================================
+
+void handleDesign() {
+
+  String html =
+    htmlHeader("Dashboard Design");
+
+  html += "<div class='card'>";
+
+  html += "<div class='section-title'>";
+  html += "DASHBOARD DESIGNER";
+  html += "</div>";
+
+  html += "<p class='subtitle'>";
+  html += "Change the dashboard directly from the browser. ";
+  html += "Settings are stored inside ESP32.";
+  html += "</p>";
+
+  html += "<form method='POST' action='/design-save'>";
+
+  html += "<div class='form-grid'>";
+
+  // Title
+  html += "<div>";
+  html += "<label>Dashboard Title</label>";
+  html += "<input name='title' value='";
+  html += htmlEscape(dashboardTitle);
+  html += "'>";
+  html += "</div>";
+
+  // Site
+  html += "<div>";
+  html += "<label>Site / Company Name</label>";
+  html += "<input name='site' value='";
+  html += htmlEscape(siteName);
+  html += "'>";
+  html += "</div>";
+
+  // Theme
+  html += "<div>";
+  html += "<label>Theme</label>";
+  html += "<select name='theme'>";
+
+  html += "<option value='blue' ";
+  html += selected(dashboardTheme, "blue");
+  html += ">Blue</option>";
+
+  html += "<option value='dark' ";
+  html += selected(dashboardTheme, "dark");
+  html += ">Dark</option>";
+
+  html += "<option value='light' ";
+  html += selected(dashboardTheme, "light");
+  html += ">Light</option>";
+
+  html += "</select>";
+  html += "</div>";
+
+  // Accent
+  html += "<div>";
+  html += "<label>Accent Color</label>";
+  html += "<input name='accent' type='color' value='";
+  html += dashboardAccent;
+  html += "'>";
+  html += "</div>";
+
+  // Background
+  html += "<div>";
+  html += "<label>Background</label>";
+  html += "<select name='background'>";
+
+  html += "<option value='gradient' ";
+  html += selected(dashboardBackground, "gradient");
+  html += ">Gradient</option>";
+
+  html += "<option value='solid' ";
+  html += selected(dashboardBackground, "solid");
+  html += ">Solid</option>";
+
+  html += "</select>";
+  html += "</div>";
+
+  // Density
+  html += "<div>";
+  html += "<label>Dashboard Density</label>";
+  html += "<select name='density'>";
+
+  html += "<option value='compact' ";
+  html += selected(dashboardDensity, "compact");
+  html += ">Compact</option>";
+
+  html += "<option value='normal' ";
+  html += selected(dashboardDensity, "normal");
+  html += ">Normal</option>";
+
+  html += "</select>";
+  html += "</div>";
+
+  // Radius
+  html += "<div>";
+  html += "<label>Card Corner Radius</label>";
+  html += "<input name='radius' type='number' min='0' max='35' value='";
+  html += String(dashboardRadius);
+  html += "'>";
+  html += "</div>";
+
+  // Refresh
+  html += "<div>";
+  html += "<label>Refresh Interval (seconds)</label>";
+  html += "<input name='refresh' type='number' min='2' max='60' value='";
+  html += String(refreshSeconds);
+  html += "'>";
+  html += "</div>";
+
+  // Power unit
+  html += "<div>";
+  html += "<label>Power Unit</label>";
+  html += "<select name='unit'>";
+
+  html += "<option value='kW' ";
+  html += selected(powerUnit, "kW");
+  html += ">kW</option>";
+
+  html += "<option value='W' ";
+  html += selected(powerUnit, "W");
+  html += ">W</option>";
+
+  html += "</select>";
+  html += "</div>";
+
+  html += "</div>";
+
+  // ----------------------------------------------------------
+  // SHOW/HIDE OPTIONS
+  // ----------------------------------------------------------
+
+  html += "<br>";
+
+  html += "<div class='section-title'>";
+  html += "SHOW / HIDE DASHBOARD SECTIONS";
+  html += "</div>";
+
+  html += "<div class='check-grid'>";
+
+  html += "<label class='checkbox'>";
+  html += "<input type='checkbox' name='showAC' ";
+  html += checked(showAC);
+  html += "> AC";
+  html += "</label>";
+
+  html += "<label class='checkbox'>";
+  html += "<input type='checkbox' name='showHeater' ";
+  html += checked(showHeater);
+  html += "> Heater";
+  html += "</label>";
+
+  html += "<label class='checkbox'>";
+  html += "<input type='checkbox' name='showLights' ";
+  html += checked(showLights);
+  html += "> Lights";
+  html += "</label>";
+
+  html += "<label class='checkbox'>";
+  html += "<input type='checkbox' name='showVoltage' ";
+  html += checked(showVoltage);
+  html += "> Voltage";
+  html += "</label>";
+
+  html += "<label class='checkbox'>";
+  html += "<input type='checkbox' name='showCurrent' ";
+  html += checked(showCurrent);
+  html += "> Current";
+  html += "</label>";
+
+  html += "<label class='checkbox'>";
+  html += "<input type='checkbox' name='showEnergy' ";
+  html += checked(showEnergy);
+  html += "> Energy";
+  html += "</label>";
+
+  html += "<label class='checkbox'>";
+  html += "<input type='checkbox' name='showBilling' ";
+  html += checked(showBilling);
+  html += "> Billing";
+  html += "</label>";
+
+  html += "<label class='checkbox'>";
+  html += "<input type='checkbox' name='showHistory' ";
+  html += checked(showHistory);
+  html += "> 7-Day History";
+  html += "</label>";
+
+  html += "<label class='checkbox'>";
+  html += "<input type='checkbox' name='showSave' ";
+  html += checked(showEnergySaving);
+  html += "> Energy Saving";
+  html += "</label>";
+
+  html += "</div>";
+
+  html += "<br>";
+
+  html += "<button class='btn' type='submit'>";
+  html += "SAVE DASHBOARD DESIGN";
+  html += "</button>";
+
+  html += "</form>";
+
+  html += "</div>";
+
+  // ----------------------------------------------------------
+  // CURRENT DESIGN
+  // ----------------------------------------------------------
+
+  html += "<div class='card' style='margin-top:10px'>";
+
+  html += "<div class='section-title'>";
+  html += "CURRENT DESIGN";
+  html += "</div>";
+
+  html += "<table class='table'>";
+
+  html += "<tr><td>Theme</td><td>";
+  html += dashboardTheme;
+  html += "</td></tr>";
+
+  html += "<tr><td>Accent</td><td>";
+  html += dashboardAccent;
+  html += "</td></tr>";
+
+  html += "<tr><td>Background</td><td>";
+  html += dashboardBackground;
+  html += "</td></tr>";
+
+  html += "<tr><td>Density</td><td>";
+  html += dashboardDensity;
+  html += "</td></tr>";
+
+  html += "</table>";
+
+  html += "</div>";
+
+  html += htmlFooter();
+
+  server.send(200, "text/html", html);
+}
+
+// ============================================================
+// SAVE DASHBOARD DESIGN
+// ============================================================
+
+void handleDesignSave() {
+
+  if (server.hasArg("title")) {
+    dashboardTitle =
+      server.arg("title");
+  }
+
+  if (server.hasArg("site")) {
+    siteName =
+      server.arg("site");
+  }
+
+  if (server.hasArg("theme")) {
+    dashboardTheme =
+      server.arg("theme");
+  }
+
+  if (server.hasArg("accent")) {
+    dashboardAccent =
+      server.arg("accent");
+  }
+
+  if (server.hasArg("background")) {
+    dashboardBackground =
+      server.arg("background");
+  }
+
+  if (server.hasArg("density")) {
+    dashboardDensity =
+      server.arg("density");
+  }
+
+  if (server.hasArg("radius")) {
+
+    dashboardRadius =
+      server.arg("radius").toInt();
+
+    dashboardRadius =
+      constrain(
+        dashboardRadius,
+        0,
+        35
+      );
+  }
+
+  if (server.hasArg("refresh")) {
+
+    refreshSeconds =
+      server.arg("refresh").toInt();
+
+    refreshSeconds =
+      constrain(
+        refreshSeconds,
+        2,
+        60
+      );
+  }
+
+  if (server.hasArg("unit")) {
+    powerUnit =
+      server.arg("unit");
+  }
+
+  showAC =
+    server.hasArg("showAC");
+
+  showHeater =
+    server.hasArg("showHeater");
+
+  showLights =
+    server.hasArg("showLights");
+
+  showVoltage =
+    server.hasArg("showVoltage");
+
+  showCurrent =
+    server.hasArg("showCurrent");
+
+  showEnergy =
+    server.hasArg("showEnergy");
+
+  showBilling =
+    server.hasArg("showBilling");
+
+  showHistory =
+    server.hasArg("showHistory");
+
+  showEnergySaving =
+    server.hasArg("showSave");
+
+  saveDashboardSettings();
+
+  server.sendHeader(
+    "Location",
+    "/design"
+  );
+
+  server.send(
+    303,
+    "text/plain",
+    ""
+  );
+}
+
+// ============================================================
+// WIFI PAGE
+// ============================================================
+
+void handleWiFiPage() {
+
+  String html =
+    htmlHeader("Wi-Fi");
+
+  html += "<div class='card'>";
+
+  html += "<div class='section-title'>";
+  html += "WI-FI CONFIGURATION";
+  html += "</div>";
+
+  html += "<p>";
+
+  if (WiFi.status() == WL_CONNECTED) {
+
+    html += "Connected to: <b>";
+    html += WiFi.SSID();
+    html += "</b><br>";
+
+    html += "IP Address: <b>";
+    html += WiFi.localIP().toString();
+    html += "</b><br>";
+
+    html += "Hostname: <b>";
+    html += HOSTNAME;
+    html += ".local</b>";
+
+  } else {
+
+    html += "Wi-Fi is not connected.";
+  }
+
+  html += "</p>";
+
+  html += "<form method='POST' action='/wifi-save'>";
+
+  html += "<label>Wi-Fi SSID</label>";
+
+  html += "<input name='ssid' value='";
+  html += htmlEscape(savedSSID);
+  html += "'>";
+
+  html += "<br><br>";
+
+  html += "<label>Wi-Fi Password</label>";
+
+  html += "<input name='password' type='password' value='";
+  html += htmlEscape(savedPassword);
+  html += "'>";
+
+  html += "<br><br>";
+
+  html += "<button class='btn' type='submit'>";
+  html += "SAVE WI-FI & RESTART";
+  html += "</button>";
+
+  html += "</form>";
+
+  html += "</div>";
+
+  html += htmlFooter();
+
+  server.send(200, "text/html", html);
+}
+
+// ============================================================
+// SAVE WIFI
+// ============================================================
+
+void handleWiFiSave() {
+
+  String ssid =
+    server.arg("ssid");
+
+  String password =
+    server.arg("password");
+
+  if (ssid.length() == 0) {
+
+    server.send(
+      400,
+      "text/plain",
+      "SSID cannot be empty."
+    );
+
+    return;
+  }
+
+  saveWiFiSettings(
+    ssid,
+    password
+  );
+
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{
+font-family:Arial;
+background:#07111f;
+color:white;
+text-align:center;
+padding:40px;
+}
+.card{
+max-width:500px;
+margin:auto;
+padding:25px;
+background:#10263d;
+border-radius:15px;
+}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>Wi-Fi Saved</h2>
+<p>ESP32 will restart now.</p>
+<p>Reconnect your phone/PC to the configured Wi-Fi.</p>
+</div>
+</body>
+</html>
+)rawliteral";
+
+  server.send(
+    200,
+    "text/html",
+    html
+  );
+
+  delay(1500);
+
+  ESP.restart();
+}
+
+// ============================================================
+// PZEM SETUP PAGE
+// ============================================================
+
+void handlePZEMPage() {
+
+  String html =
+    htmlHeader("PZEM Setup");
+
+  html += "<div class='card'>";
+
+  html += "<div class='section-title'>";
+  html += "PZEM ADDRESS COMMISSIONING";
+  html += "</div>";
+
+  html += "<p class='subtitle'>";
+  html += "Use this only when commissioning a PZEM meter. ";
+  html += "Connect and commission one PZEM at a time.";
+  html += "</p>";
+
+  html += "<p><b>Important:</b> Do not connect mains power until wiring has been checked and protected.</p>";
+
+  html += "<form method='GET' action='/pzem-set'>";
+
+  html += "<label>Target Address</label>";
+
+  html += "<select name='address'>";
+
+  html += "<option value='1'>01 - AC</option>";
+  html += "<option value='2'>02 - Heater</option>";
+  html += "<option value='3'>03 - Lights</option>";
+
+  html += "</select>";
+
+  html += "<br><br>";
+
+  html += "<button class='btn' type='submit'>";
+  html += "SET ADDRESS";
+  html += "</button>";
+
+  html += "</form>";
+
+  html += "</div>";
+
+  html += htmlFooter();
+
+  server.send(
+    200,
+    "text/html",
+    html
+  );
+}
+
+// ============================================================
+// PZEM ADDRESS COMMISSIONING
+// ============================================================
+
+void handlePZEMSet() {
+
+  int target =
+    server.arg("address").toInt();
+
+  uint8_t newAddress;
+
+  if (target == 1) {
+
+    newAddress =
+      PZEM_AC_ADDRESS;
+
+  } else if (target == 2) {
+
+    newAddress =
+      PZEM_HEATER_ADDRESS;
+
+  } else if (target == 3) {
+
+    newAddress =
+      PZEM_LIGHTS_ADDRESS;
+
+  } else {
+
+    server.send(
+      400,
+      "text/plain",
+      "Invalid address."
+    );
+
+    return;
+  }
+
+  /*
+    The PZEM library changes the address of the meter
+    connected to the serial bus.
+
+    Only ONE PZEM should be connected during commissioning.
+  */
+
+  bool result =
+    pzemAC.setAddress(newAddress);
+
+  String html =
+    htmlHeader("PZEM Result");
+
+  html += "<div class='card'>";
+
+  html += "<div class='section-title'>";
+  html += "PZEM COMMISSIONING RESULT";
+  html += "</div>";
+
+  if (result) {
+
+    html += "<p>Address successfully changed to:</p>";
+
+    html += "<div class='metric-value'>0x";
+
+    if (newAddress < 16)
+      html += "0";
+
+    html += String(
+      newAddress,
+      HEX
+    );
+
+    html += "</div>";
+
+  } else {
+
+    html += "<div class='warning'>";
+    html += "Address change failed.";
+    html += "</div>";
+  }
+
+  html += "<p class='subtitle'>";
+  html += "Disconnect this PZEM before commissioning another one.";
+  html += "</p>";
+
+  html += "</div>";
+
+  html += htmlFooter();
+
+  server.send(
+    200,
+    "text/html",
+    html
+  );
+}
+
+// ============================================================
+// RESET DATA PAGE
+// ============================================================
+
+void handleResetPage() {
+
+  String html =
+    htmlHeader("Reset");
+
+  html += "<div class='card'>";
+
+  html += "<div class='section-title'>";
+  html += "RESET ENERGY DATA";
+  html += "</div>";
+
+  html += "<p>";
+  html += "This will clear daily energy, monthly energy and 7-day history.";
+  html += "</p>";
+
+  html += "<a class='btn danger' href='/reset-confirm'>";
+  html += "RESET ENERGY DATA";
+  html += "</a>";
+
+  html += "</div>";
+
+  html += htmlFooter();
+
+  server.send(
+    200,
+    "text/html",
+    html
+  );
+}
+
+// ============================================================
+// RESET CONFIRM
+// ============================================================
+
+void handleResetConfirm() {
+
+  totalTodayEnergy = 0;
+  totalMonthEnergy = 0;
+
+  for (int i = 0; i < HISTORY_DAYS; i++) {
+
+    historyEnergy[i] = 0;
+    historyDate[i] = "";
+  }
+
+  saveEnergyData();
+
+  String html =
+    htmlHeader("Reset Complete");
+
+  html += "<div class='card'>";
+
+  html += "<div class='section-title'>";
+  html += "ENERGY DATA RESET";
+  html += "</div>";
+
+  html += "<p>Daily, monthly and history data have been cleared.</p>";
+
+  html += "<a class='btn' href='/'>";
+  html += "BACK TO DASHBOARD";
+  html += "</a>";
+
+  html += "</div>";
+
+  html += htmlFooter();
+
+  server.send(
+    200,
+    "text/html",
+    html
+  );
+}
+
+// ============================================================
+// WIFI CONNECTION
+// ============================================================
+
+bool connectToWiFi() {
+
+  if (savedSSID.length() == 0) {
+    return false;
+  }
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.setHostname(HOSTNAME);
+
+  WiFi.begin(
+    savedSSID.c_str(),
+    savedPassword.c_str()
+  );
+
+  Serial.print(
+    "Connecting to Wi-Fi"
+  );
+
+  unsigned long start =
+    millis();
+
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    millis() - start < 15000UL
+  ) {
+
+    delay(500);
+
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() ==
+      WL_CONNECTED) {
+
+    wifiConnected = true;
+
+    Serial.println(
+      "Wi-Fi connected."
+    );
+
+    Serial.print(
+      "IP: "
+    );
+
+    Serial.println(
+      WiFi.localIP()
+    );
+
+    if (MDNS.begin(HOSTNAME)) {
+
+      Serial.print(
+        "mDNS: http://"
+      );
+
+      Serial.print(
+        HOSTNAME
+      );
+
+      Serial.println(
+        ".local"
+      );
+    }
+
+    return true;
+  }
+
+  wifiConnected = false;
+
+  Serial.println(
+    "Wi-Fi connection failed."
+  );
+
+  return false;
+}
+
+// ============================================================
+// SETUP AP
+// ============================================================
+
+void startSetupAP() {
+
+  WiFi.mode(WIFI_AP);
+
+  WiFi.softAP(
+    WIFI_AP_NAME,
+    WIFI_AP_PASSWORD
+  );
+
+  IPAddress ip =
+    WiFi.softAPIP();
+
+  Serial.println();
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "SMART ENERGY WIFI SETUP"
+  );
+
+  Serial.print(
+    "AP: "
+  );
+
+  Serial.println(
+    WIFI_AP_NAME
+  );
+
+  Serial.print(
+    "Password: "
+  );
+
+  Serial.println(
+    WIFI_AP_PASSWORD
+  );
+
+  Serial.print(
+    "Open: http://"
+  );
+
+  Serial.println(
+    ip
+  );
+
+  Serial.println(
+    "================================"
+  );
+}
+
+// ============================================================
+// ROUTES
+// ============================================================
+
+void setupRoutes() {
+
+  server.on(
+    "/",
+    HTTP_GET,
+    handleRoot
+  );
+
+  server.on(
+    "/api",
+    HTTP_GET,
+    handleAPI
+  );
+
+  server.on(
+    "/controls",
+    HTTP_GET,
+    handleControls
+  );
+
+  server.on(
+    "/relay-enable",
+    HTTP_GET,
+    handleRelayEnable
+  );
+
+  server.on(
+    "/relay",
+    HTTP_GET,
+    handleRelay
+  );
+
+  server.on(
+    "/autosave-test",
+    HTTP_GET,
+    handleAutoSaveTest
+  );
+
+  server.on(
+    "/settings",
+    HTTP_GET,
+    handleSettings
+  );
+
+  server.on(
+    "/settings-save",
+    HTTP_POST,
+    handleSettingsSave
+  );
+
+  server.on(
+    "/design",
+    HTTP_GET,
+    handleDesign
+  );
+
+  server.on(
+    "/design-save",
+    HTTP_POST,
+    handleDesignSave
+  );
+
+  server.on(
+    "/wifi",
+    HTTP_GET,
+    handleWiFiPage
+  );
+
+  server.on(
+    "/wifi-save",
+    HTTP_POST,
+    handleWiFiSave
+  );
+
+  server.on(
+    "/pzem",
+    HTTP_GET,
+    handlePZEMPage
+  );
+
+  server.on(
+    "/pzem-set",
+    HTTP_GET,
+    handlePZEMSet
+  );
+
+  server.on(
+    "/reset",
+    HTTP_GET,
+    handleResetPage
+  );
+
+  server.on(
+    "/reset-confirm",
+    HTTP_GET,
+    handleResetConfirm
+  );
+
+  server.onNotFound(
+    []() {
+
+      server.send(
+        404,
+        "text/plain",
+        "404 - Page not found"
+      );
+    }
+  );
+}
+
+// ============================================================
+// SAFE RELAY STARTUP
+// ============================================================
+
+void setupRelays() {
+
+  pinMode(
+    RELAY_AC_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    RELAY_HEATER_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    RELAY_LIGHTS_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    RELAY_SPARE_PIN,
+    OUTPUT
+  );
+
+  // Always start safely OFF
+  allRelaysOff();
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "SMART ENERGY SYSTEM"
+  );
+
+  Serial.println(
+    "CODE 655"
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+  // ----------------------------------------------------------
+  // RELAYS
+  // ----------------------------------------------------------
+
+  setupRelays();
+
+  // ----------------------------------------------------------
+  // LOAD SETTINGS
+  // ----------------------------------------------------------
+
+  loadWiFiSettings();
+  loadSystemSettings();
+  loadDashboardSettings();
+  loadEnergyData();
+
+  // ----------------------------------------------------------
+  // PZEM SERIAL
+  // ----------------------------------------------------------
+
+  PZEMSerial.begin(
+    9600,
+    SERIAL_8N1,
+    PZEM_RX_PIN,
+    PZEM_TX_PIN
+  );
+
+  // ----------------------------------------------------------
+  // TIME
+  // ----------------------------------------------------------
+
+  configTime(
+    LOCAL_TIMEZONE_OFFSET,
+    0,
+    "pool.ntp.org",
+    "time.nist.gov"
+  );
+
+  // ----------------------------------------------------------
+  // WIFI
+  // ----------------------------------------------------------
+
+  if (!connectToWiFi()) {
+
+    startSetupAP();
+  }
+
+  // ----------------------------------------------------------
+  // WEB ROUTES
+  // ----------------------------------------------------------
+
+  setupRoutes();
+
+  server.begin();
+
+  Serial.println(
+    "Web server started."
+  );
+
+  // ----------------------------------------------------------
+  // CURRENT DATE
+  // ----------------------------------------------------------
+
+  String date =
+    getDateString();
+
+  if (date.length() > 0) {
+
+    if (currentDate == "") {
+
+      currentDate = date;
+
+      saveEnergyData();
+    }
+  }
+
+  lastMeterRead = millis();
+  lastEnergyIntegration = millis();
+  lastSave = millis();
+}
+
+// ============================================================
+// WIFI RECONNECT
+// ============================================================
+
+void maintainWiFi() {
+
+  if (savedSSID.length() == 0) {
+    return;
+  }
+
+  if (WiFi.status() ==
+      WL_CONNECTED) {
+
+    wifiConnected = true;
+    return;
+  }
+
+  wifiConnected = false;
+
+  unsigned long now =
+    millis();
+
+  if (
+    now - lastWifiAttempt <
+    WIFI_RETRY_MS
+  ) {
+    return;
+  }
+
+  lastWifiAttempt = now;
+
+  Serial.println(
+    "Trying Wi-Fi reconnect..."
+  );
+
+  WiFi.disconnect();
+
+  WiFi.begin(
+    savedSSID.c_str(),
+    savedPassword.c_str()
+  );
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop() {
+
+  server.handleClient();
+
+  maintainWiFi();
+
+  unsigned long now =
+    millis();
+
+  // ----------------------------------------------------------
+  // READ PZEM
+  // ----------------------------------------------------------
+
+  if (
+    now - lastMeterRead >=
+    READ_INTERVAL_MS
+  ) {
+
+    lastMeterRead = now;
+
+    readAllMeters();
+
+    integrateEnergy();
+
+    checkDateChange();
+
+    /*
+      TEST MODE:
+      Only automatic-saving control uses simulated power.
+
+      PZEM readings themselves remain unchanged.
+    */
+
+    if (energySavingTestMode) {
+
+      controlPowerW =
+        testPowerW;
+
+    } else {
+
+      controlPowerW =
+        totalPowerW;
+    }
+
+    energySavingLogic();
+
+    calculateBilling();
+  }
+
+  // ----------------------------------------------------------
+  // SAVE DATA
+  // ----------------------------------------------------------
+
+  if (
+    now - lastSave >=
+    SAVE_INTERVAL_MS
+  ) {
+
+    lastSave = now;
+
+    saveEnergyData();
+
+    saveSystemSettings();
+  }
+
+  delay(2);
+}
