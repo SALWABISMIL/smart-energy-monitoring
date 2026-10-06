@@ -26,7 +26,7 @@
 
    DASHBOARD:
    7-DAY HISTORY IS PART OF MAIN DASHBOARD
-   AND HAS NO INTERNAL SCROLLING.
+   DAY NAME + DATE + ENERGY
 */
 
 #include <WiFi.h>
@@ -85,7 +85,6 @@ Preferences preferences;
 
 HardwareSerial PZEMSerial(2);
 
-// Correct constructor for installed PZEM library.
 PZEM004Tv30 pzemAC(
   PZEMSerial,
   PZEM_RX_PIN,
@@ -261,7 +260,6 @@ String formatPower(float watts) {
   watts = safeFloat(watts);
 
   if (powerUnit == "W") {
-
     return String(watts, 0) + " W";
   }
 
@@ -269,7 +267,6 @@ String formatPower(float watts) {
 }
 
 String boolText(bool value) {
-
   return value ? "ON" : "OFF";
 }
 
@@ -347,6 +344,94 @@ int getMonthNumber() {
   }
 
   return timeinfo.tm_mon;
+}
+
+// ============================================================
+// WEEKDAY NAME
+// Converts YYYY-MM-DD into Sunday/Monday/etc.
+// ============================================================
+
+int getWeekdayFromDate(String date) {
+
+  if (date.length() != 10) {
+    return -1;
+  }
+
+  int year =
+    date.substring(0, 4).toInt();
+
+  int month =
+    date.substring(5, 7).toInt();
+
+  int day =
+    date.substring(8, 10).toInt();
+
+  if (
+    year < 2000 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31
+  ) {
+    return -1;
+  }
+
+  // Sakamoto algorithm
+  static const int monthTable[] = {
+    0, 3, 2, 5, 0, 3,
+    5, 1, 4, 6, 2, 4
+  };
+
+  int y = year;
+
+  if (month < 3) {
+    y -= 1;
+  }
+
+  int weekday =
+    (
+      y +
+      y / 4 -
+      y / 100 +
+      y / 400 +
+      monthTable[month - 1] +
+      day
+    ) % 7;
+
+  return weekday;
+}
+
+String getWeekdayName(String date) {
+
+  int weekday =
+    getWeekdayFromDate(date);
+
+  switch (weekday) {
+
+    case 0:
+      return "Sunday";
+
+    case 1:
+      return "Monday";
+
+    case 2:
+      return "Tuesday";
+
+    case 3:
+      return "Wednesday";
+
+    case 4:
+      return "Thursday";
+
+    case 5:
+      return "Friday";
+
+    case 6:
+      return "Saturday";
+
+    default:
+      return "-";
+  }
 }
 
 // ============================================================
@@ -1285,8 +1370,6 @@ void energySavingLogic() {
     ? testPowerW
     : totalPowerW;
 
-  // START ENERGY SAVING
-
   if (
     controlPowerW >=
     energySaveOnW &&
@@ -1312,8 +1395,6 @@ void energySavingLogic() {
     );
   }
 
-  // RETURN TO NORMAL
-
   else if (
     controlPowerW <=
     energySaveOffW &&
@@ -1335,11 +1416,7 @@ void energySavingLogic() {
     Serial.println(
       "ENERGY SAVING: NORMAL"
     );
-
-    // Heater remains OFF intentionally.
   }
-
-  // REAL SAVINGS
 
   if (
     energySavingActive &&
@@ -1459,8 +1536,6 @@ String htmlHeader(
   html += "background:rgba(255,255,255,.18);";
   html += "}";
 
-  // Main dashboard grid
-
   html += ".grid{";
   html += "display:grid;";
   html += "grid-template-columns:repeat(3,minmax(0,1fr));";
@@ -1579,7 +1654,7 @@ String htmlHeader(
   html += "}";
 
   // ==========================================================
-  // COMPACT 7-DAY HISTORY
+  // 7 DAY HISTORY
   // ==========================================================
 
   html += ".history-card{";
@@ -1624,7 +1699,16 @@ String htmlHeader(
   html += "font-weight:bold;";
   html += "}";
 
-  // Billing / saving / status cards
+  html += ".history-day{";
+  html += "font-weight:bold;";
+  html += "color:#ffffff;";
+  html += "}";
+
+  html += ".history-date{";
+  html += "font-size:10px;";
+  html += "color:#91a9c1;";
+  html += "margin-left:6px;";
+  html += "}";
 
   html += ".dashboard-small{";
   html += "min-height:100%;";
@@ -1642,8 +1726,6 @@ String htmlHeader(
   html += "border-top:1px solid rgba(255,255,255,.12);";
   html += "}";
 
-  // Tablet
-
   html += "@media(max-width:900px){";
 
   html += ".grid{";
@@ -1659,8 +1741,6 @@ String htmlHeader(
   html += "}";
 
   html += "}";
-
-  // Phone
 
   html += "@media(max-width:550px){";
 
@@ -1778,10 +1858,6 @@ void handleDashboard() {
       dashboardTitle,
       true
     );
-
-  // ==========================================================
-  // MAIN GRID
-  // ==========================================================
 
   html += "<div class='grid'>";
 
@@ -1996,9 +2072,7 @@ void handleDashboard() {
 
   // ==========================================================
   // 7 DAY HISTORY
-  // IMPORTANT:
-  // NOW INSIDE MAIN DASHBOARD GRID
-  // NO INTERNAL SCROLLING
+  // DAY NAME + DATE + ENERGY
   // ==========================================================
 
   if (showHistory) {
@@ -2020,7 +2094,7 @@ void handleDashboard() {
     html += "<table class='history-table'>";
 
     html += "<tr>";
-    html += "<th>DAY</th>";
+    html += "<th>DAY / DATE</th>";
     html += "<th class='history-energy'>ENERGY</th>";
     html += "</tr>";
 
@@ -2047,13 +2121,25 @@ void handleDashboard() {
         historyDate[index].length() > 0
       ) {
 
-        html +=
-          historyDate[index];
+        html += "<span class='history-day'>";
+
+        html += getWeekdayName(
+          historyDate[index]
+        );
+
+        html += "</span>";
+
+        html += "<span class='history-date'>";
+
+        html += historyDate[index];
+
+        html += "</span>";
 
       } else {
 
-        html +=
-          "-";
+        html += "<span class='history-day'>";
+        html += "-";
+        html += "</span>";
       }
 
       html += "</td>";
@@ -2240,10 +2326,6 @@ void handleDashboard() {
   html += "</div>";
 
   html += "</div>";
-
-  // ==========================================================
-  // END MAIN GRID
-  // ==========================================================
 
   html += "</div>";
 
@@ -3537,14 +3619,6 @@ void handlePZEMSet() {
     return;
   }
 
-  /*
-     IMPORTANT:
-     Only ONE PZEM should be connected.
-
-     The currently connected PZEM is
-     programmed using pzemAC.
-  */
-
   bool result =
     pzemAC.setAddress(
       (uint8_t)newAddress
@@ -3849,9 +3923,6 @@ void setup() {
     RELAY_SPARE_PIN,
     OUTPUT
   );
-
-  // SAFETY:
-  // All relays OFF at startup.
 
   allRelaysOff();
 
